@@ -5416,11 +5416,12 @@ def test_iot_jitr_auto_registration_on_connect(monkeypatch):
     """
     import ssl
 
+    from ministack.core.x509_utils import get_certificate_id
     from ministack.services import iot as iot_module
 
     ca_pem, leaf_pem = _generate_ca_and_leaf()
     off_ca_pem, off_leaf_pem = _generate_ca_and_leaf()
-    cert_id = iot_module.get_certificate_id(leaf_pem)
+    cert_id = get_certificate_id(leaf_pem)
     peer = ("192.0.2.10", 50000)
     received: list = []
 
@@ -5440,7 +5441,7 @@ def test_iot_jitr_auto_registration_on_connect(monkeypatch):
 
         off_der = ssl.PEM_cert_to_DER_cert(off_leaf_pem)
         assert not await iot_module._mtls_auto_register(off_der, peer)
-        assert iot_module.get_certificate_id(off_leaf_pem) not in iot_module._certificates
+        assert get_certificate_id(off_leaf_pem) not in iot_module._certificates
 
         record["status"] = "INACTIVE"
         assert not await iot_module._mtls_auto_register(der, peer)

@@ -31,6 +31,7 @@ import contextvars
 import copy
 import hashlib
 import importlib
+import importlib.util
 import io
 import json
 import logging
@@ -280,12 +281,18 @@ def _proxy_url_for(config: dict) -> str | None:
     return os.environ.get(_PROXY_PREFIX + name) or None
 
 
-try:
-    docker_lib: Any = importlib.import_module("docker")
-    _docker_available = True
-except ImportError:
-    docker_lib = None
-    _docker_available = False
+# Importing the docker SDK costs ~160 ms and pulls in requests, so a MiniStack
+# that never runs a container-backed function never pays for it.
+_docker_available = importlib.util.find_spec("docker") is not None
+docker_lib: Any = None
+
+
+def _docker_lib() -> Any:
+    """The docker SDK, imported on first use and cached on ``docker_lib``."""
+    global docker_lib
+    if docker_lib is None:
+        docker_lib = importlib.import_module("docker")
+    return docker_lib
 
 _cached_docker_client = None
 _is_in_container: bool | None = None
@@ -321,7 +328,7 @@ def _get_docker_client():
     if not _docker_available:
         return None
     try:
-        _cached_docker_client = docker_lib.from_env(timeout=_DOCKER_TIMEOUT)
+        _cached_docker_client = _docker_lib().from_env(timeout=_DOCKER_TIMEOUT)
         return _cached_docker_client
     except Exception:
         return None
@@ -4045,7 +4052,7 @@ def _parse_docker_flags(flags: str) -> dict:
             host = parts[0]
             container = parts[1] if len(parts) > 1 else parts[0]
             ro = len(parts) > 2 and parts[2] == "ro"
-            mounts.append(docker_lib.types.Mount(container, host, type="bind", read_only=ro))
+            mounts.append(_docker_lib().types.Mount(container, host, type="bind", read_only=ro))
         kwargs["mounts"] = mounts
 
     if args.dns:
@@ -4419,9 +4426,9 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             # which Docker rejects with "mount path must be absolute" (#1205).
             _use_docker_cp = True
         else:
-            mounts.append(docker_lib.types.Mount("/var/task", code_dir, type="bind", read_only=True))
+            mounts.append(_docker_lib().types.Mount("/var/task", code_dir, type="bind", read_only=True))
             if is_provided:
-                mounts.append(docker_lib.types.Mount("/var/runtime", code_dir, type="bind", read_only=True))
+                mounts.append(_docker_lib().types.Mount("/var/runtime", code_dir, type="bind", read_only=True))
 
     # CMD / EntryPoint
     run_kwargs: dict = {
@@ -4520,8 +4527,8 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         # function pinned a platform — with no declaration any cached image is
         # the host's, which is what will run.
         if docker_arch and local_image.attrs.get("Architecture") not in (None, docker_arch):
-            raise docker_lib.errors.ImageNotFound("cached image is the wrong architecture")
-    except docker_lib.errors.ImageNotFound:
+            raise _docker_lib().errors.ImageNotFound("cached image is the wrong architecture")
+    except _docker_lib().errors.ImageNotFound:
         logger.info("Pulling Lambda image: %s (%s)", image, docker_platform or "host platform")
         try:
             client.images.pull(image, platform=docker_platform)

@@ -25,6 +25,7 @@ import datetime as dt
 import fnmatch
 import hashlib
 import importlib
+import importlib.util
 import json
 import logging
 import os
@@ -75,12 +76,17 @@ EKS_BASE_PORT = int(os.environ.get("EKS_BASE_PORT", "16443"))
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 
 
-try:
-    docker_lib = importlib.import_module("docker")
-    _docker_available = True
-except ImportError:
-    docker_lib = None
-    _docker_available = False
+# Same as lambda_svc: the docker SDK is imported on first use, not at import.
+_docker_available = importlib.util.find_spec("docker") is not None
+docker_lib = None
+
+
+def _docker_lib():
+    """The docker SDK, imported on first use and cached on ``docker_lib``."""
+    global docker_lib
+    if docker_lib is None:
+        docker_lib = importlib.import_module("docker")
+    return docker_lib
 
 # ---------------------------------------------------------------------------
 # State
@@ -358,7 +364,7 @@ def _get_docker():
     if not _docker_available:
         return None
     try:
-        return docker_lib.from_env(timeout=_DOCKER_TIMEOUT)
+        return _docker_lib().from_env(timeout=_DOCKER_TIMEOUT)
     except Exception:
         return None
 

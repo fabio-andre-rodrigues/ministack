@@ -64,6 +64,7 @@ import copy
 import hashlib
 import hmac
 import html as html_mod
+import importlib.util
 import json
 import logging
 import os
@@ -100,8 +101,6 @@ logger = logging.getLogger("cognito")
 # RSA key pair for JWKS / token signing
 # ---------------------------------------------------------------------------
 
-_RSA_PRIVATE_KEY = None
-_JWKS_KEY: dict = {}
 
 # Real Cognito keeps its signing key stable across restarts and exposes the
 # matching public key on the JWKS endpoint. Without persistence, every Python
@@ -112,114 +111,107 @@ _STATE_DIR = os.environ.get("STATE_DIR", "/tmp/ministack-state")
 _RSA_KEY_PATH = os.path.join(_STATE_DIR, "cognito-rsa-key.pem")
 _RSA_KEY_LOCK_PATH = f"{_RSA_KEY_PATH}.lock"
 
+# `cryptography` is imported, and the key minted, on first use: it is ~9 MiB and a
+# 2048-bit keygen that every process paid at import even when it issued no token.
+_CRYPTO_AVAILABLE = importlib.util.find_spec("cryptography") is not None
+
 try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+
+def _load_rsa_key_from_disk():
     from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
 
     try:
-        import fcntl
-    except ImportError:
-        fcntl = None
+        with open(_RSA_KEY_PATH, "rb") as _f:
+            return serialization.load_pem_private_key(_f.read(), password=None)
+    except Exception:
+        return None
 
-    def _load_rsa_key_from_disk():
+
+def _open_rsa_key_lock_file():
+    while True:
         try:
-            with open(_RSA_KEY_PATH, "rb") as _f:
-                return serialization.load_pem_private_key(_f.read(), password=None)
-        except Exception:
-            return None
-
-    def _open_rsa_key_lock_file():
-        while True:
+            return open(_RSA_KEY_LOCK_PATH, "a")
+        except IsADirectoryError:
+            # Recover lock directories left by earlier MiniStack versions.
+            # rmdir only removes a directory, so a concurrent process that
+            # already converted the path to the new lock file cannot have
+            # its live lock stolen here.
             try:
-                return open(_RSA_KEY_LOCK_PATH, "a")
-            except IsADirectoryError:
-                # Recover lock directories left by earlier MiniStack versions.
-                # rmdir only removes a directory, so a concurrent process that
-                # already converted the path to the new lock file cannot have
-                # its live lock stolen here.
-                try:
-                    os.rmdir(_RSA_KEY_LOCK_PATH)
-                except (FileNotFoundError, NotADirectoryError):
-                    continue
+                os.rmdir(_RSA_KEY_LOCK_PATH)
+            except (FileNotFoundError, NotADirectoryError):
                 continue
+            continue
 
-    def _persist_or_load_rsa_key(_key):
-        os.makedirs(_STATE_DIR, exist_ok=True)
-        _pem = _key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-        _tmp_path = f"{_RSA_KEY_PATH}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
-        try:
-            # A file lock gives process-safe creation/repair without relying
-            # on hard links, and the OS releases it if a process exits mid-repair.
-            if fcntl is not None:
-                with _open_rsa_key_lock_file() as _lock_file:
-                    fcntl.flock(_lock_file.fileno(), fcntl.LOCK_EX)
-                    # Another process may have generated or repaired the shared
-                    # key first. Reload that winner so pytest workers and the
-                    # server expose the same JWKS.
-                    _disk_key = _load_rsa_key_from_disk()
-                    if _disk_key is not None:
-                        return _disk_key
-                    with open(_tmp_path, "xb") as _f:
-                        _f.write(_pem)
-                        _f.flush()
-                        os.fsync(_f.fileno())
-                    os.replace(_tmp_path, _RSA_KEY_PATH)
-                    _tmp_path = None
-                    return _key
-            # Platforms without fcntl still get a stable signing key in-process
-            # and best-effort atomic persistence across restarts.
-            _disk_key = _load_rsa_key_from_disk()
-            if _disk_key is not None:
-                return _disk_key
-            with open(_tmp_path, "xb") as _f:
-                _f.write(_pem)
-                _f.flush()
-                os.fsync(_f.fileno())
-            os.replace(_tmp_path, _RSA_KEY_PATH)
-            _tmp_path = None
-            return _key
-        finally:
-            if _tmp_path is not None:
-                try:
-                    os.unlink(_tmp_path)
-                except FileNotFoundError:
-                    pass
 
-    def _persist_or_load_rsa_key_best_effort(_key):
-        try:
-            return _persist_or_load_rsa_key(_key)
-        except Exception:
-            # Persistence is best-effort — if it fails, fall back to in-memory key.
-            return _key
+def _persist_or_load_rsa_key(_key):
+    from cryptography.hazmat.primitives import serialization
 
-    _rsa_key = _load_rsa_key_from_disk() if os.path.exists(_RSA_KEY_PATH) else None
-    if _rsa_key is None:
-        _rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        _rsa_key = _persist_or_load_rsa_key_best_effort(_rsa_key)
-    _RSA_PRIVATE_KEY = _rsa_key
+    os.makedirs(_STATE_DIR, exist_ok=True)
+    _pem = _key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    _tmp_path = f"{_RSA_KEY_PATH}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    try:
+        # A file lock gives process-safe creation/repair without relying
+        # on hard links, and the OS releases it if a process exits mid-repair.
+        if fcntl is not None:
+            with _open_rsa_key_lock_file() as _lock_file:
+                fcntl.flock(_lock_file.fileno(), fcntl.LOCK_EX)
+                # Another process may have generated or repaired the shared
+                # key first. Reload that winner so pytest workers and the
+                # server expose the same JWKS.
+                _disk_key = _load_rsa_key_from_disk()
+                if _disk_key is not None:
+                    return _disk_key
+                with open(_tmp_path, "xb") as _f:
+                    _f.write(_pem)
+                    _f.flush()
+                    os.fsync(_f.fileno())
+                os.replace(_tmp_path, _RSA_KEY_PATH)
+                _tmp_path = None
+                return _key
+        # Platforms without fcntl still get a stable signing key in-process
+        # and best-effort atomic persistence across restarts.
+        _disk_key = _load_rsa_key_from_disk()
+        if _disk_key is not None:
+            return _disk_key
+        with open(_tmp_path, "xb") as _f:
+            _f.write(_pem)
+            _f.flush()
+            os.fsync(_f.fileno())
+        os.replace(_tmp_path, _RSA_KEY_PATH)
+        _tmp_path = None
+        return _key
+    finally:
+        if _tmp_path is not None:
+            try:
+                os.unlink(_tmp_path)
+            except FileNotFoundError:
+                pass
 
-    _pub = _rsa_key.public_key()
-    _pub_numbers = _pub.public_numbers()
 
-    def _int_to_base64url(n: int, length: int) -> str:
-        data = n.to_bytes(length, byteorder="big")
-        return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+def _persist_or_load_rsa_key_best_effort(_key):
+    try:
+        return _persist_or_load_rsa_key(_key)
+    except Exception:
+        # Persistence is best-effort — if it fails, fall back to in-memory key.
+        return _key
 
-    _JWKS_KEY = {
-        "kty": "RSA",
-        "alg": "RS256",
-        "use": "sig",
-        "kid": "ministack-key-1",
-        "n": _int_to_base64url(_pub_numbers.n, 256),
-        "e": _int_to_base64url(_pub_numbers.e, 3),
-    }
-except ImportError:
-    # Fallback: static dummy key when cryptography is not installed
-    _JWKS_KEY = {
+
+def _int_to_base64url(n: int, length: int) -> str:
+    data = n.to_bytes(length, byteorder="big")
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _static_jwks_key() -> dict:
+    """The advertised key when `cryptography` is unavailable, so JWKS still answers."""
+    return {
         "kty": "RSA",
         "alg": "RS256",
         "use": "sig",
@@ -234,8 +226,50 @@ except ImportError:
     }
 
 
+def _build_signing_key():
+    """Load or mint the pool signing key, and derive its JWKS entry."""
+    global _RSA_PRIVATE_KEY, _JWKS_KEY
+    if not _CRYPTO_AVAILABLE:
+        _RSA_PRIVATE_KEY = None
+        _JWKS_KEY = _static_jwks_key()
+        return
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = _load_rsa_key_from_disk() if os.path.exists(_RSA_KEY_PATH) else None
+    if key is None:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        key = _persist_or_load_rsa_key_best_effort(key)
+    numbers = key.public_key().public_numbers()
+    _RSA_PRIVATE_KEY = key
+    _JWKS_KEY = {
+        "kty": "RSA",
+        "alg": "RS256",
+        "use": "sig",
+        "kid": "ministack-key-1",
+        "n": _int_to_base64url(numbers.n, 256),
+        "e": _int_to_base64url(numbers.e, 3),
+    }
+
+
+
+def _ensure_signing_key() -> None:
+    """Materialise the signing key and its JWKS entry, once."""
+    if "_JWKS_KEY" not in globals():
+        _build_signing_key()
+
+
+def __getattr__(name):
+    """PEP 562 hook so ``cognito._RSA_PRIVATE_KEY`` and ``cognito._JWKS_KEY``
+    still resolve for callers outside this module, building them on demand."""
+    if name in ("_RSA_PRIVATE_KEY", "_JWKS_KEY"):
+        _build_signing_key()
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 def well_known_jwks(pool_id: str):
     """Return JWKS JSON for /{poolId}/.well-known/jwks.json."""
+    _ensure_signing_key()
     return 200, {"Content-Type": "application/json"}, json.dumps({"keys": [_JWKS_KEY]}).encode()
 
 
@@ -831,6 +865,7 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         json.dumps(claims).encode()
     ).rstrip(b"=").decode()
     signing_input = f"{header}.{payload}".encode()
+    _ensure_signing_key()
     if _RSA_PRIVATE_KEY is not None:
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import padding

@@ -81,12 +81,6 @@ from ministack.core.responses import (
     new_uuid,
     request_scope,
 )
-from ministack.core.x509_utils import (
-    certificate_is_signed_by,
-    generate_ca,
-    get_certificate_id,
-    sign_leaf_certificate,
-)
 
 logger = logging.getLogger("iot")
 
@@ -130,6 +124,7 @@ _ca_key_pem: str | None = None
 
 def _ensure_ca() -> tuple[str, str]:
     """Return (cert_pem, key_pem), generating lazily on first use."""
+    from ministack.core.x509_utils import generate_ca
     global _ca_cert_pem, _ca_key_pem
     if _ca_cert_pem is not None and _ca_key_pem is not None:
         return _ca_cert_pem, _ca_key_pem
@@ -1422,6 +1417,7 @@ async def _publish_certificate_registered(
 
 def _create_keys_and_certificate(qp: dict) -> tuple:
     """Generate a fresh keypair and sign a leaf certificate with the Local CA."""
+    from ministack.core.x509_utils import get_certificate_id, sign_leaf_certificate
     set_active = qp.get("setAsActive", "false").lower() == "true"
     try:
         ca_cert_pem, ca_key_pem = _ensure_ca()
@@ -1478,6 +1474,7 @@ async def _register_certificate(
     sends that event only from a device connect (see ``_mtls_auto_register``),
     and refuses a registration with status PENDING_ACTIVATION.
     """
+    from ministack.core.x509_utils import certificate_is_signed_by, get_certificate_id
     cert_pem = payload.get("certificatePem") or qp.get("certificatePem")
     if not cert_pem:
         return error_response_json(
@@ -1643,6 +1640,7 @@ def _register_ca_certificate(payload: dict, qp: dict) -> tuple:
     omitted, as on AWS). ``setAsActive`` / ``allowAutoRegistration`` ride as
     query-string booleans, as on AWS.
     """
+    from ministack.core.x509_utils import get_certificate_id
     ca_pem = payload.get("caCertificate")
     if not ca_pem:
         return error_response_json(
@@ -7543,6 +7541,10 @@ _mtls_logger = logging.getLogger("iot_mtls")
 _mtls_server: asyncio.AbstractServer | None = None
 _mtls_loop: asyncio.AbstractEventLoop | None = None
 _mtls_lock = asyncio.Lock()
+# Built on the first connection and reused, dropped by _mtls_stop_locked so a
+# reset that drops the CA cannot serve a stale chain.
+_mtls_ssl_context = None
+_mtls_context_lock = asyncio.Lock()
 # Every live connection's writer, so that stopping the listener can close them
 # deliberately and in bounded time (see ``mtls_stop``).
 _mtls_sessions: set[asyncio.StreamWriter] = set()
@@ -7626,6 +7628,8 @@ def _mtls_cert_is_reusable(cert_pem: str, ca_cert_pem: str) -> bool:
     """True when a persisted server certificate still matches the current CA
     and still covers every configured name."""
     from cryptography import x509
+
+    from ministack.core.x509_utils import certificate_is_signed_by
 
     # The CA subject name is a constant, so issuer equality alone would also
     # accept a leaf signed by a *previous* CA generation — which is exactly
@@ -7815,17 +7819,13 @@ async def _mtls_start_locked() -> None:
     if port is None:
         return
     try:
-        # Building the context can mint the server certificate — and, on first
-        # boot, the CA — which is RSA keygen, so keep it off the event loop.
-        ctx = await asyncio.to_thread(_mtls_build_ssl_context)
-    except Exception as e:
-        _mtls_logger.warning(
-            "IoT mTLS: could not build the TLS context (%s); listener unavailable", e
-        )
-        return
-    try:
-        _mtls_server = await asyncio.start_server(
-            _mtls_handle_conn, host="0.0.0.0", port=port, ssl=ctx
+        # Bound without a TLS context. Building one mints the server certificate
+        # and, on first boot, the CA: that imports `cryptography` and runs RSA
+        # keygen, ~14 MiB and a keygen that every boot paid for whether or not a
+        # device ever connected. _MtlsAcceptor defers both to the first one.
+        loop = asyncio.get_running_loop()
+        _mtls_server = await loop.create_server(
+            _MtlsAcceptor, host="0.0.0.0", port=port
         )
     except OSError as e:
         _mtls_logger.warning(
@@ -7840,7 +7840,8 @@ async def _mtls_start_locked() -> None:
 
 
 async def _mtls_stop_locked() -> None:
-    global _mtls_server
+    global _mtls_server, _mtls_ssl_context
+    _mtls_ssl_context = None
     if _mtls_server is None and not _mtls_sessions:
         return
     if _mtls_server is not None:
@@ -7960,6 +7961,7 @@ def _mtls_auto_registering_ca(account_id: str, region: str, ca_id: str | None) -
 
 def _mtls_auto_registering_signers(cert_pem: str) -> list[tuple[str, str, str]]:
     """Every (account_id, region, ca_id) of an auto-registering CA that signed ``cert_pem``."""
+    from ministack.core.x509_utils import certificate_is_signed_by
     return [
         (account_id, region, ca_id)
         for (account_id, region, ca_id), ca in list(_ca_certificates._data.items())
@@ -8097,6 +8099,67 @@ async def _mtls_close(writer: asyncio.StreamWriter) -> None:
         await writer.wait_closed()
     except (OSError, ssl.SSLError):
         pass
+
+
+async def _mtls_context():
+    """The listener's TLS context, built once on first use.
+
+    ``None`` when it cannot be built, which refuses that connection instead of
+    failing the boot — the listener stays bound and a later attempt retries.
+    """
+    global _mtls_ssl_context
+    async with _mtls_context_lock:
+        if _mtls_ssl_context is None:
+            try:
+                # RSA keygen on first boot, so keep it off the event loop.
+                _mtls_ssl_context = await asyncio.to_thread(_mtls_build_ssl_context)
+            except Exception as e:
+                _mtls_logger.warning(
+                    "IoT mTLS: could not build the TLS context (%s); connection refused", e
+                )
+                return None
+        return _mtls_ssl_context
+
+
+class _MtlsAcceptor(asyncio.Protocol):
+    """Accepts plaintext, upgrades to TLS, then runs the ordinary stream session.
+
+    ``pause_reading`` before anything is read is what makes this portable: the
+    ClientHello stays in the kernel buffer, so there is no Python-side buffer for
+    the upgrade to lose. ``loop.start_tls`` resumes reading itself once the TLS
+    protocol is installed. (3.13 can also move a StreamReader's buffer into the
+    handshake, 3.12 and older cannot, and this package supports 3.10+.)
+    """
+
+    def __init__(self):
+        self._transport = None
+
+    def connection_made(self, transport):
+        self._transport = transport
+        transport.pause_reading()
+        asyncio.get_running_loop().create_task(self._upgrade(transport))
+
+    async def _upgrade(self, transport):
+        loop = asyncio.get_running_loop()
+        ctx = await _mtls_context()
+        if ctx is None:
+            transport.abort()
+            return
+        reader = asyncio.StreamReader(loop=loop)
+        protocol = asyncio.StreamReaderProtocol(reader, loop=loop)
+        try:
+            tls_transport = await loop.start_tls(
+                transport, protocol, ctx, server_side=True
+            )
+        except Exception as e:
+            _mtls_logger.debug("IoT mTLS: TLS handshake failed: %s", e)
+            transport.abort()
+            return
+        # SSLProtocol is built with call_connection_made=False, so the stream
+        # protocol has to be attached to the upgraded transport by hand.
+        protocol.connection_made(tls_transport)
+        writer = asyncio.StreamWriter(tls_transport, protocol, reader, loop)
+        await _mtls_handle_conn(reader, writer)
 
 
 async def _mtls_handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:

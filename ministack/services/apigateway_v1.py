@@ -101,8 +101,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-import yaml
-
 from ministack.core.arn import ArnParseError, execute_api_arn, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
@@ -2018,7 +2016,7 @@ async def _authorize_request_v1(
 _GATEWAY_ERROR_MESSAGES = {
     "INVALID_API_KEY": "Forbidden",
     "THROTTLED": "Too Many Requests",
-    "QUOTA_EXCEEDED": "Limit Exceeded",  # not captured
+    "QUOTA_EXCEEDED": "Limit Exceeded",
     "UNSUPPORTED_MEDIA_TYPE": "Unsupported Media Type",
     "BAD_REQUEST_BODY": "Invalid request body",
 }
@@ -3217,6 +3215,8 @@ def _get_export(api_id, stage_name, export_type, headers, query_params):
     if extension == "json":
         body = json.dumps(document, ensure_ascii=False).encode("utf-8")
     else:
+        import yaml
+
         body = yaml.safe_dump(document, sort_keys=False).encode("utf-8")
 
     api_name = re.sub(r"[^A-Za-z0-9._-]+", "-", _rest_apis[api_id].get("name", "api"))
