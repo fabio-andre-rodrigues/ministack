@@ -3178,7 +3178,15 @@ def main():
             if port != "443" and _port_is_bindable(bind_host, 443):
                 config.bind.append(f"{bind_host}:443")
 
-        asyncio.run(hypercorn_serve(app, config))
+        try:
+            asyncio.run(hypercorn_serve(app, config))
+        except OSError:
+            if len(config.bind) == 1:
+                raise
+            config.bind = config.bind[:1]
+            logger.warning("Port 443 became unavailable; serving on %s only",
+                           config.bind[0])
+            asyncio.run(hypercorn_serve(app, config))
     finally:
         _cleanup()
 

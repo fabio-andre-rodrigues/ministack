@@ -14,6 +14,22 @@ import sys
 import tempfile
 
 
+def _write_atomic(path: str, data: bytes) -> "str | None":
+    """Write `data` to `path` via a rename, or None on failure.
+
+    Containers spawn concurrently and mount these files, so a reader must never
+    see a half-written one.
+    """
+    try:
+        handle, staging = tempfile.mkstemp(dir=os.path.dirname(path))
+        with os.fdopen(handle, "wb") as out:
+            out.write(data)
+        os.replace(staging, path)
+    except OSError:
+        return None
+    return path
+
+
 def use_ssl_enabled() -> bool:
     return os.environ.get("USE_SSL", "").strip().lower() in ("1", "true", "yes")
 
@@ -36,16 +52,11 @@ def ca_bundle_path(cert_path: str) -> "str | None":
     system = paths.cafile or paths.openssl_cafile
     if not system or not os.path.exists(system):
         return None
-    bundle = os.path.join(os.path.dirname(cert_path), "ca-bundle.pem")
     try:
-        with open(bundle, "wb") as out:
-            for source in (system, cert_path):
-                with open(source, "rb") as handle:
-                    out.write(handle.read())
-                    out.write(b"\n")
+        blob = b"\n".join(open(source, "rb").read() for source in (system, cert_path))
     except OSError:
         return None
-    return bundle
+    return _write_atomic(os.path.join(os.path.dirname(cert_path), "ca-bundle.pem"), blob)
 
 
 JAVA_TRUSTSTORE_PASSWORD = "changeit"
@@ -84,13 +95,7 @@ def java_truststore_path(cert_path: str) -> "str | None":
             )
     except Exception:
         return None
-    store = os.path.join(os.path.dirname(cert_path), "truststore.p12")
-    try:
-        with open(store, "wb") as handle:
-            handle.write(blob)
-    except OSError:
-        return None
-    return store
+    return _write_atomic(os.path.join(os.path.dirname(cert_path), "truststore.p12"), blob)
 
 
 def _cert_names(cert_path: str, name: str) -> bool:
