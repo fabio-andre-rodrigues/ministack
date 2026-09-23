@@ -182,6 +182,8 @@ _PERSISTED_BUCKET_DICTS = {
     # baked into client configuration, so member buckets coming back without the
     # alias fronting them fails where a missing bucket would not.
     "mraps": _mraps,
+    "object_tags": _object_tags,
+    "object_acl": _object_acl,
 }
 
 
@@ -195,6 +197,10 @@ def get_state():
     state = {"buckets_meta": copy.deepcopy(buckets_meta)}
     for key, d in _PERSISTED_BUCKET_DICTS.items():
         state[key] = copy.deepcopy(d)
+    versions_meta = AccountScopedDict()
+    for scoped_key, versions in _object_versions._data.items():
+        versions_meta._data[scoped_key] = [{k: v for k, v in e.items() if k != "data"} for e in versions]
+    state["object_versions"] = copy.deepcopy(versions_meta)
     return state
 
 
@@ -218,6 +224,54 @@ def _restore_state(data):
             _buckets.setdefault(name, {"objects": {}}).update(meta)
     for key, d in _PERSISTED_BUCKET_DICTS.items():
         d.update(data.get(key, {}))
+    saved_versions = data.get("object_versions")
+    if isinstance(saved_versions, AccountScopedDict):
+        for scoped_key, versions in saved_versions._data.items():
+            _restore_object_versions(scoped_key, versions)
+    for store in (_object_tags, _object_acl):
+        for scoped_key in list(store._data):
+            account_id, (bucket_name, key, version_id) = scoped_key
+            if not _restored_object_exists(account_id, bucket_name, key, version_id):
+                del store._data[scoped_key]
+
+
+def _restored_object_exists(account_id: str, bucket_name: str, key: str, version_id: str | None) -> bool:
+    bucket = _buckets._data.get((account_id, bucket_name))
+    if bucket is None:
+        return False
+    versions = _object_versions._data.get((account_id, (bucket_name, key)), [])
+    vids = {v["version_id"] for v in versions if not v.get("is_delete_marker")}
+    if version_id:
+        return version_id in vids
+    current = bucket["objects"].get(key)
+    return "null" in vids or (current is not None and not current.get("version_id"))
+
+
+def _restore_object_versions(scoped_key, versions: list):
+    account_id, (bucket_name, key) = scoped_key
+    bucket = _buckets._data.get((account_id, bucket_name))
+    if bucket is None:
+        return
+    current = bucket["objects"].get(key)
+    current_vid = (current.get("version_id") or "null") if current is not None else None
+    kept = [
+        v
+        for v in versions
+        if v.get("is_delete_marker")
+        or v["version_id"] == current_vid
+        or (S3_PERSIST and _version_file_exists(bucket_name, key, v["version_id"], account_id))
+    ]
+    if current is not None and all(v["version_id"] != current_vid for v in kept):
+        kept += [v for v in _object_versions._data.get(scoped_key, []) if v["version_id"] == current_vid]
+    if not kept:
+        _object_versions._data.pop(scoped_key, None)
+        return
+    for v in kept:
+        v["is_latest"] = False
+    kept[-1]["is_latest"] = True
+    _object_versions._data[scoped_key] = kept
+    if kept[-1].get("is_delete_marker"):
+        bucket["objects"].pop(key, None)
 
 
 
@@ -750,11 +804,7 @@ def _get_object_data(bucket_name: str, key: str, version_id: str | None = None) 
     if version_id:
         for v in _object_versions.get((bucket_name, key), []):
             if v["version_id"] == version_id:
-                data = v.get("data")
-                if data is not None:
-                    return data
-                obj = bucket["objects"].get(key)
-                return _read_body(bucket_name, key, obj) if obj else None
+                return _version_body(bucket, bucket_name, key, v)
         return None
     obj = bucket["objects"].get(key)
     if obj is None:
@@ -4095,9 +4145,9 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
                 precondition = _check_read_preconditions(headers, vobj, resp_headers)
                 if precondition is not None:
                     return precondition
-                body = v.get("data")
+                body = _version_body(bucket, bucket_name, key, v)
                 if body is None:
-                    body = _read_body(bucket_name, key, bucket["objects"].get(key, {}))
+                    break
                 return 200, resp_headers, body
         return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
 
@@ -4497,6 +4547,7 @@ def _record_object_version(bucket_name: str, key: str, prior_obj: dict | None, o
     versioning = _bucket_versioning.get(bucket_name)
     if versioning not in ("Enabled", "Suspended"):
         return None
+    _persist_displaced_version(bucket_name, key, prior_obj, versioning)
     vkey = (bucket_name, key)
     versions = _object_versions.setdefault(vkey, [])
     if versioning == "Enabled":
@@ -4518,9 +4569,11 @@ def _record_delete_marker(bucket_name: str, key: str, prior_obj: dict | None) ->
     """Append a delete marker per the bucket's versioning state and return its
     version id: a fresh id on Enabled, the literal "null" on Suspended — where
     the marker REPLACES any existing null version, as AWS does."""
+    enabled = _bucket_versioning.get(bucket_name) == "Enabled"
+    _persist_displaced_version(bucket_name, key, prior_obj, "Enabled" if enabled else "Suspended")
     vkey = (bucket_name, key)
     versions = _object_versions.setdefault(vkey, [])
-    if _bucket_versioning.get(bucket_name) == "Enabled":
+    if enabled:
         _preserve_null_version(bucket_name, key, versions, prior_obj)
         marker_id = new_uuid()
     else:
@@ -4601,6 +4654,7 @@ def _delete_object_version(bucket: dict, bucket_name: str, key: str, version_id:
         return False, False
 
     removed = versions.pop(idx)
+    _delete_version_file(bucket_name, key, version_id)
     was_delete_marker = bool(removed.get("is_delete_marker"))
     # Per-version tags and ACLs travel with the version being removed.
     _object_tags.pop((bucket_name, key, version_id), None)
@@ -4623,7 +4677,11 @@ def _delete_object_version(bucket: dict, bucket_name: str, key: str, version_id:
     if latest.get("is_delete_marker"):
         bucket["objects"].pop(key, None)
     else:
-        bucket["objects"][key] = _object_record_from_version(latest)
+        record = _object_record_from_version(latest)
+        record["body"] = _version_body(bucket, bucket_name, key, latest)
+        bucket["objects"][key] = record
+        if S3_PERSIST:
+            _persist_object(bucket_name, key, record)
     return True, was_delete_marker
 
 
@@ -4851,7 +4909,10 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
             (v for v in _object_versions.get((src_bucket_name, src_key), []) if v["version_id"] == src_version_id),
             None,
         )
-        if ventry is None or ventry.get("is_delete_marker"):
+        ventry_body = None
+        if ventry is not None and not ventry.get("is_delete_marker"):
+            ventry_body = _version_body(src_bucket, src_bucket_name, src_key, ventry)
+        if ventry_body is None:
             return _error(
                 "NoSuchVersion",
                 "The specified version does not exist.",
@@ -4862,7 +4923,7 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         # the body plus the wire metadata, so a COPY metadata-directive carries
         # the version's user metadata and headers like a current-object copy.
         src_obj = {
-            "body": ventry.get("data", b""),
+            "body": ventry_body,
             "etag": ventry["etag"],
             "size": ventry["size"],
             "last_modified": ventry["last_modified"],
@@ -6143,14 +6204,16 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
             (v for v in _object_versions.get((src_bucket_name, src_key), []) if v["version_id"] == src_version_id),
             None,
         )
-        if ventry is None or ventry.get("is_delete_marker"):
+        src_body = None
+        if ventry is not None and not ventry.get("is_delete_marker"):
+            src_body = _version_body(src_bucket, src_bucket_name, src_key, ventry)
+        if src_body is None:
             return _error(
                 "NoSuchVersion",
                 "The specified version does not exist.",
                 404,
                 f"/{src_bucket_name}/{src_key}",
             )
-        src_body = ventry.get("data") or b""
     else:
         if src_key not in src_bucket["objects"]:
             return _error("NoSuchKey", "The specified key does not exist.", 404)
@@ -6668,6 +6731,75 @@ def _delete_persisted_object(bucket_name: str, key: str):
         logger.warning("Failed to delete persisted S3 object %s/%s: %s", bucket_name, key, e)
 
 
+_VERSIONS_DIR = ".versions"
+
+
+def _version_disk_path(bucket: str, key: str, version_id: str, account_id: str = None) -> str | None:
+    if account_id is None:
+        account_id = get_account_id()
+    root = os.path.realpath(os.path.join(DATA_DIR, _VERSIONS_DIR, account_id, bucket, version_id))
+    candidate = os.path.realpath(os.path.join(root, key))
+    try:
+        if candidate == root or os.path.commonpath([root, candidate]) != root:
+            logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
+            return None
+    except ValueError:
+        logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
+        return None
+    return candidate
+
+
+def _version_file_exists(bucket_name: str, key: str, version_id: str, account_id: str = None) -> bool:
+    fpath = _version_disk_path(bucket_name, key, version_id, account_id)
+    return fpath is not None and os.path.isfile(fpath)
+
+
+def _persist_displaced_version(bucket_name: str, key: str, prior_obj: dict | None, versioning: str):
+    if not S3_PERSIST:
+        return
+    try:
+        if versioning == "Suspended":
+            _delete_version_file(bucket_name, key, "null")
+        if prior_obj is None:
+            return
+        prior_vid = prior_obj.get("version_id") or "null"
+        if versioning == "Suspended" and prior_vid == "null":
+            return
+        fpath = _version_disk_path(bucket_name, key, prior_vid)
+        if fpath is None:
+            return
+        os.makedirs(os.path.dirname(fpath), mode=0o700, exist_ok=True)
+        _atomic_write(fpath, _read_body(bucket_name, key, prior_obj))
+    except Exception as e:
+        logger.warning("Failed to persist S3 object version %s/%s: %s", bucket_name, key, e)
+
+
+def _delete_version_file(bucket_name: str, key: str, version_id: str):
+    if not S3_PERSIST:
+        return
+    try:
+        fpath = _version_disk_path(bucket_name, key, version_id)
+        if fpath is not None and os.path.exists(fpath):
+            os.remove(fpath)
+    except Exception as e:
+        logger.warning("Failed to delete persisted S3 object version %s/%s: %s", bucket_name, key, e)
+
+
+def _version_body(bucket: dict, bucket_name: str, key: str, v: dict) -> bytes | None:
+    if v.get("data") is not None:
+        return v["data"]
+    if S3_PERSIST and _version_file_exists(bucket_name, key, v["version_id"]):
+        try:
+            with open(_version_disk_path(bucket_name, key, v["version_id"]), "rb") as f:
+                return f.read()
+        except Exception as e:
+            logger.warning("Failed to read persisted S3 object version %s/%s: %s", bucket_name, key, e)
+    current = bucket["objects"].get(key)
+    if current is not None and (current.get("version_id") or "null") == v["version_id"]:
+        return _read_body(bucket_name, key, current)
+    return None
+
+
 def _delete_persisted_bucket(name: str):
     """Remove a bucket's account-scoped on-disk directory when the bucket is deleted.
 
@@ -6712,6 +6844,8 @@ def _load_persisted_data():
             if not os.path.isdir(entry_path):
                 continue
             # Detect if this entry is an account ID directory (12-digit or has bucket subdirs)
+            if entry == _VERSIONS_DIR:
+                continue
             if entry.isdigit() and len(entry) == 12:
                 # New layout: entry is an account ID
                 _load_persisted_account(entry, entry_path)

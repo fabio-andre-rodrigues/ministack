@@ -1850,6 +1850,40 @@ def test_s3_central_restore_preserves_metadata_and_objects(monkeypatch, tmp_path
             assert s3._buckets["empty-bucket"]["objects"] == {}
 
 
+def test_s3_delete_marker_and_version_history_survive_restart(monkeypatch, tmp_path):
+    """A delete marker stays latest across a restart; older versions keep their bytes, tags and ACLs."""
+    from ministack.core.responses import request_scope
+    from ministack.services import s3
+
+    monkeypatch.setattr(s3, "DATA_DIR", str(tmp_path / "objects"))
+    monkeypatch.setattr(s3, "S3_PERSIST", True)
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path / "state"))
+    s3.reset()
+    try:
+        with request_scope("111111111111", "us-east-1"):
+            s3._create_bucket("versioned", b"")
+            s3._bucket_versioning["versioned"] = "Enabled"
+            vids = [s3._put_object("versioned", "k", body, {"x-amz-tagging": f"n={body.decode()}"})[1]["x-amz-version-id"]
+                    for body in (b"one", b"two")]
+            s3._put_object_acl("versioned", "k", b"", {"x-amz-acl": "public-read"}, {"versionId": [vids[0]]})
+            marker = s3._delete_object("versioned", "k")[1]["x-amz-version-id"]
+        persistence.save_state("s3", s3.get_state())
+        s3.reset()
+        s3._load_persisted_data()
+        s3.load_persisted_state(persistence.load_state("s3"))
+        with request_scope("111111111111", "us-east-1"):
+            assert s3._head_object("versioned", "k")[0] == 404
+            versions = s3._object_versions[("versioned", "k")]
+            assert [v["version_id"] for v in versions] == [*vids, marker]
+            assert versions[-1]["is_latest"] and versions[-1]["is_delete_marker"]
+            assert [s3._get_object_data("versioned", "k", version_id=v) for v in vids] == [b"one", b"two"]
+            assert [s3._object_tags[("versioned", "k", v)] for v in vids] == [{"n": "one"}, {"n": "two"}]
+            assert "AllUsers" in s3._object_acl[("versioned", "k", vids[0])]
+    finally:
+        s3.reset()
+
+
 # ── PERSIST_STATE gating ──────────────────────────────────────────────
 
 @pytest.mark.parametrize("svc_key", [
