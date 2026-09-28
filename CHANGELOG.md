@@ -5,6 +5,12 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **CloudWatch Logs — delivery destination policy** — `PutDeliveryDestinationPolicy`, `GetDeliveryDestinationPolicy`, `DeleteDeliveryDestinationPolicy`. Required by an operator that authorizes `delivery.logs.amazonaws.com` to create deliveries to a `DeliveryDestination` (e.g. CloudFront access-log delivery to a log group) — `PutDeliveryDestinationPolicy` previously had no route, blocking the delivery from ever being created. Contributed by @fabio-andre-rodrigues.
+
 ## [1.5.17] — 2026-09-25
 
 ### Added
