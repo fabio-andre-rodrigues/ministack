@@ -459,7 +459,7 @@ subnet = ec2.create_subnet(
 
 | Feature | Details |
 |---------|---------|
-| **Stack Operations** | CreateStack, UpdateStack, DeleteStack, DescribeStacks, ListStacks, DescribeStackEvents, DescribeStackResource, DescribeStackResources, GetTemplate, ValidateTemplate, GetTemplateSummary |
+| **Stack Operations** | CreateStack, UpdateStack, DeleteStack, DescribeStacks, ListStacks, DescribeStackEvents, DescribeStackResource, DescribeStackResources, GetTemplate, ValidateTemplate, GetTemplateSummary, RollbackStack |
 | **Change Sets** | CreateChangeSet, DescribeChangeSet, ExecuteChangeSet, DeleteChangeSet, ListChangeSets |
 | **Exports** | ListExports — cross-stack references via `Fn::ImportValue` |
 | **Template Formats** | JSON and YAML (including `!Ref`, `!Sub`, `!GetAtt` shorthand tags) |
@@ -470,7 +470,8 @@ subnet = ec2.create_subnet(
 | **Conditions** | Fn::Equals, Fn::And, Fn::Or, Fn::Not — conditional resource creation |
 | **Rules** | The `Rules` section runs after the parameters resolve and before any resource is touched (CreateStack, UpdateStack, CreateChangeSet): `RuleCondition`, `Assertions` with `AssertDescription`, Fn::And/Or/Not/Equals/If/Contains/EachMemberEquals/EachMemberIn and Ref; Fn::RefAll, Fn::ValueOf and Fn::ValueOfAll read the EC2 store for VPC, subnet and security-group ids |
 | **Transforms** | `AWS::Serverless-2016-10-31` (SAM, in the `full` image), `AWS::LanguageExtensions` (`Fn::ForEach` over a literal list, a `CommaDelimitedList` parameter, `Fn::FindInMap` or `Fn::Split`, nested and inside `Properties`; `${Id}` / `&{Id}` in the fragment keys, `${Id}` in `Fn::Sub` and a `Ref` to the identifier; `Fn::Length`, `Fn::ToJsonString`) and the embedded `AWS::Include` transform (`Fn::Transform` with an `s3://` `Location`, JSON or YAML snippets) |
-| **Rollback** | Configurable via `DisableRollback` — on failure, previously created resources are cleaned up in reverse dependency order |
+| **Rollback** | Configurable via `DisableRollback` — on failure, previously created resources are cleaned up in reverse dependency order; a stack left `CREATE_FAILED` or `UPDATE_FAILED` by `DisableRollback` is rolled back later with RollbackStack (`ROLLBACK_COMPLETE` or `UPDATE_ROLLBACK_COMPLETE`, `RetainExceptOnCreate` honoured) |
+| **Drift Detection** | DetectStackDrift, DescribeStackDriftDetectionStatus, DetectStackResourceDrift, DescribeStackResourceDrifts (status filters, `MaxResults`/`NextToken`), and `DriftInformation` on DescribeStacks, ListStacks and the stack resource calls. Detection completes synchronously and compares the properties the template sets with the service's current record. Property-level drift (`PropertyDifferences`, expected and actual properties) for AWS::SQS::Queue, AWS::SSM::Parameter, AWS::SNS::Topic, AWS::Lambda::Function, AWS::IAM::Role, AWS::DynamoDB::Table, AWS::S3::Bucket (name, versioning), AWS::Logs::LogGroup and AWS::SecretsManager::Secret; stack-level tags count toward `Tags`. Existence only (`IN_SYNC` or `DELETED`) for AWS::Kinesis::Stream, AWS::ECR::Repository, AWS::StepFunctions::StateMachine, AWS::Events::Rule and AWS::SNS::Subscription. Every other type is `NOT_CHECKED` |
 | **Async Status** | Stacks deploy asynchronously (`CREATE_IN_PROGRESS` → `CREATE_COMPLETE`) — poll with DescribeStacks |
 | **Quotas** | The template and stack quotas of the CloudFormation quotas page are enforced before a stack exists: 51,200 bytes of `TemplateBody`, 1,000,000 bytes behind `TemplateURL`, 500 resources, 200 parameters / outputs / mappings, 200 attributes per mapping, 255-character names, a 1,024-byte description, 4,096-byte parameter values, and a stack name of up to 128 alphanumeric characters and hyphens starting with a letter |
 
