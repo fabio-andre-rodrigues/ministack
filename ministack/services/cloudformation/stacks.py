@@ -5,6 +5,7 @@ CloudFormation stacks — async stack lifecycle (deploy, delete, update, diff).
 """
 
 import asyncio
+import contextvars
 import copy
 import logging
 from contextlib import contextmanager
@@ -15,6 +16,7 @@ from ministack.core.responses import get_region, new_uuid, now_iso, set_request_
 from .engine import (
     _NO_VALUE,
     _evaluate_conditions,
+    _extract_deps,
     _resolve_dynamic_references,
     _resolve_refs,
     _topological_sort,
@@ -121,6 +123,14 @@ def _resource_policy(res_def, attribute, resources, params, conditions, mappings
     return str(value)
 
 
+# The ClientRequestToken of the stack operation that is running. The request
+# handler sets it around the operation's handler; the background task of the
+# operation copies the context when it is scheduled, so every event the
+# operation records carries the token ("All events triggered by a given stack
+# operation are assigned the same client request token", API reference).
+CLIENT_REQUEST_TOKEN = contextvars.ContextVar("cfn_client_request_token", default="")
+
+
 def _add_event(stack_id, stack_name, logical_id, resource_type, status,
                reason="", physical_id=""):
     """Record a stack event."""
@@ -136,6 +146,9 @@ def _add_event(stack_id, stack_name, logical_id, resource_type, status,
         "ResourceStatusReason": reason,
         "Timestamp": now_iso(),
     }
+    token = CLIENT_REQUEST_TOKEN.get()
+    if token:
+        event["ClientRequestToken"] = token
     if stack_id not in _stack_events:
         _stack_events[stack_id] = []
     _stack_events[stack_id].append(event)
@@ -569,11 +582,14 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
     failed_update = None
     failed_logical_id = None
     stack.pop("_cancel_requested", None)
+    stack.pop("_cancel_token", None)
 
     for logical_id in ordered:
         if is_update and stack.pop("_cancel_requested", False):
             # CancelUpdateStack: stop before the next resource and roll the
-            # update back, as on AWS ("User Initiated").
+            # update back, as on AWS ("User Initiated"). The rollback events
+            # are the cancel's, so they carry its ClientRequestToken.
+            CLIENT_REQUEST_TOKEN.set(stack.pop("_cancel_token", ""))
             failed = cancelled = True
             fail_reason = "User Initiated"
             break
@@ -873,14 +889,37 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                physical_id=stack_id)
 
 
+def _with_dependencies(logical_ids, res_defs, remaining):
+    """``logical_ids`` plus every resource of ``remaining`` they depend on,
+    directly or through another one (Ref, Fn::GetAtt, Fn::Sub, DependsOn)."""
+    result = set(logical_ids)
+    pending = list(logical_ids)
+    while pending:
+        res_def = res_defs.get(pending.pop())
+        if not res_def:
+            continue
+        for dep in _extract_deps(res_def, remaining):
+            if dep not in result:
+                result.add(dep)
+                pending.append(dep)
+    return result
+
+
 async def _delete_stack_async(stack_name: str, stack_id: str,
-                              retain_resources=()):
+                              retain_resources=(), force=False):
     """Background task: delete all resources and mark stack DELETE_COMPLETE.
 
     A resource whose ``DeletionPolicy`` is ``Retain`` or
     ``RetainExceptOnCreate``, or whose logical id is in ``retain_resources``
     (the ``RetainResources`` parameter of a DeleteStack on a ``DELETE_FAILED``
-    stack), is skipped with a ``DELETE_SKIPPED`` event and keeps existing."""
+    stack), is skipped with a ``DELETE_SKIPPED`` event and keeps existing.
+
+    ``force`` is ``DeletionMode=FORCE_DELETE_STACK``: the console's "Force
+    delete this entire stack" "retains all resources that failed to delete,
+    and retains dependencies of those resources" (cfn-console-delete-stack),
+    and the retained ones show ``DELETE_SKIPPED``. A resource that fails to
+    delete during the forced delete is retained the same way, so the stack
+    reaches ``DELETE_COMPLETE``."""
     from ministack.services.cloudformation import _exports, _stacks
     stack = _stacks.get(stack_name)
     if not stack:
@@ -908,6 +947,13 @@ async def _delete_stack_async(stack_name: str, stack_id: str,
     # it goes first, so a retried delete reaches it.
     ordered += [lid for lid in resources if lid not in ordered]
 
+    forced_retain = set()
+    if force:
+        forced_retain = _with_dependencies(
+            [lid for lid, res in resources.items()
+             if res.get("ResourceStatus") == "DELETE_FAILED"],
+            res_defs, set(resources))
+
     delete_failures = []
     for logical_id in reversed(ordered):
         res = resources.get(logical_id)
@@ -921,7 +967,8 @@ async def _delete_stack_async(stack_name: str, stack_id: str,
             res_defs.get(logical_id), "DeletionPolicy", resources,
             stack.get("_resolved_params", {}), conditions,
             template.get("Mappings", {}) if template else {}, stack_name, stack_id)
-        if policy in _RETAINING_POLICIES or logical_id in retain_resources:
+        if (policy in _RETAINING_POLICIES or logical_id in retain_resources
+                or logical_id in forced_retain):
             _add_event(stack_id, stack_name, logical_id, rtype,
                        "DELETE_SKIPPED", physical_id=pid)
             resources.pop(logical_id, None)
@@ -944,6 +991,13 @@ async def _delete_stack_async(stack_name: str, stack_id: str,
             resources.pop(logical_id, None)
         except Exception as exc:
             logger.error("Delete of %s (%s) failed: %s", logical_id, pid, exc)
+            if force:
+                # A forced delete retains the resource, and what it depends on.
+                _add_event(stack_id, stack_name, logical_id, rtype,
+                           "DELETE_SKIPPED", str(exc), pid)
+                resources.pop(logical_id, None)
+                forced_retain |= _with_dependencies([logical_id], res_defs, set(resources))
+                continue
             _add_event(stack_id, stack_name, logical_id, rtype,
                        "DELETE_FAILED", str(exc), pid)
             res["ResourceStatus"] = "DELETE_FAILED"
@@ -978,6 +1032,30 @@ async def _delete_stack_async(stack_name: str, stack_id: str,
                physical_id=stack_id)
 
 
+# The states a stack create ends in when it failed, rolled back or not.
+_FAILED_CREATE_STATUSES = frozenset({"CREATE_FAILED", "ROLLBACK_COMPLETE", "ROLLBACK_FAILED"})
+
+
+async def _create_then_delete_on_failure(stack_name: str, stack_id: str, deploy_coro):
+    """``OnFailure=DELETE`` (CreateStack) and ``OnStackFailure=DELETE``
+    (CreateChangeSet of type CREATE): run the create, and when it fails,
+    delete the stack once the rollback is over. The stack ends
+    ``DELETE_COMPLETE``, or ``DELETE_FAILED`` when a resource does not delete
+    ("If the deletion of the stack fails, the status of the stack is
+    DELETE_FAILED", API_CreateChangeSet)."""
+    from ministack.services.cloudformation import _change_sets, _stacks
+    await deploy_coro
+    stack = _stacks.get(stack_name)
+    if not stack or stack.get("StackId") != stack_id:
+        return
+    if stack.get("StackStatus") not in _FAILED_CREATE_STATUSES:
+        return
+    await _delete_stack_async(stack_name, stack_id)
+    # A deleted stack takes its change sets with it, as DeleteStack does.
+    for cs_id in [c for c, v in _change_sets.items() if v.get("StackId") == stack_id]:
+        _change_sets.pop(cs_id, None)
+
+
 # ===========================================================================
 # Change Set Helpers
 # ===========================================================================
@@ -997,13 +1075,26 @@ _DIFFED_ATTRIBUTES = (
 )
 
 
-def _diff_resources(old_template: dict, new_template: dict) -> list:
+_POLICY_ACTIONS = {"Delete": "Delete", "Retain": "Retain", "RetainExceptOnCreate": "Retain",
+                   "Snapshot": "Snapshot"}
+
+
+def _policy_action(res_def: dict, attribute: str, prefix: str = "") -> dict:
+    """The PolicyAction member for the policy in effect on the old resource."""
+    policy = res_def.get(attribute, _default_resource_policy(res_def, attribute))
+    action = _POLICY_ACTIONS.get(policy) if isinstance(policy, str) else None
+    return {"PolicyAction": prefix + action} if action else {}
+
+
+def _diff_resources(old_template: dict, new_template: dict, resources: dict | None = None) -> list:
     """Diff two templates and return a list of change dicts.
 
     A resource is a ``Modify`` when its ``Properties`` differ or when one of the
     attributes in ``_DIFFED_ATTRIBUTES`` differs; each changed attribute becomes
     a ``Details`` entry (``Target.Attribute``, plus the property name for
     ``Properties``) and is listed in ``Scope``, as the API reference defines them.
+    ``resources`` are the stack's provisioned resources, whose physical ids a
+    ``Remove`` or ``Modify`` reports.
     """
     old_res = old_template.get("Resources", {})
     new_res = new_template.get("Resources", {})
@@ -1011,13 +1102,14 @@ def _diff_resources(old_template: dict, new_template: dict) -> list:
 
     all_keys = old_res.keys() | new_res.keys()
     for key in sorted(all_keys):
+        pid = (resources or {}).get(key, {}).get("PhysicalResourceId")
+        physical = {"PhysicalResourceId": pid} if pid else {}
         if key not in old_res:
             changes.append({
                 "ResourceChange": {
                     "Action": "Add",
                     "LogicalResourceId": key,
                     "ResourceType": new_res[key].get("Type", ""),
-                    "Replacement": "False",
                 }
             })
         elif key not in new_res:
@@ -1026,8 +1118,8 @@ def _diff_resources(old_template: dict, new_template: dict) -> list:
                     "Action": "Remove",
                     "LogicalResourceId": key,
                     "ResourceType": old_res[key].get("Type", ""),
-                    "PhysicalResourceId": "",
-                    "Replacement": "False",
+                    **physical,
+                    **_policy_action(old_res[key], "DeletionPolicy"),
                 }
             })
         else:
@@ -1048,7 +1140,7 @@ def _diff_resources(old_template: dict, new_template: dict) -> list:
             for attr in _DIFFED_ATTRIBUTES:
                 if old_res[key].get(attr) != new_res[key].get(attr):
                     details.append({
-                        "Target": {"Attribute": attr},
+                        "Target": {"Attribute": attr, "RequiresRecreation": "Never"},
                         "Evaluation": "Static",
                         "ChangeSource": "DirectModification",
                     })
@@ -1071,7 +1163,10 @@ def _diff_resources(old_template: dict, new_template: dict) -> list:
                     "Action": "Modify",
                     "LogicalResourceId": key,
                     "ResourceType": new_res[key].get("Type", ""),
+                    **physical,
                     "Replacement": replacement,
+                    **(_policy_action(new_res[key], "UpdateReplacePolicy", "ReplaceAnd")
+                       if replacement == "True" else {}),
                     "Scope": scope,
                     "Details": details,
                 }
