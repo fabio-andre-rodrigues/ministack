@@ -4875,7 +4875,7 @@ def test_lambda_cross_account_layer_under_auth_names_the_calling_user(monkeypatc
     from ministack.services import iam as iam_svc
 
     monkeypatch.setattr(app_mod, "AUTH", True)
-    key, user = "AKIALAYERCONSUMER001", "layer-consumer"  # sadscan:disable np.aws.1 - synthetic fixture key
+    key, user = "AKIALAYERCONSUMER001", "layer-consumer"
     user_arn = f"arn:aws:iam::{_CALLER_ACCOUNT}:user/{user}"
     seeded = [
         (iam_svc._users, user, {"UserName": user, "Arn": user_arn, "UserId": "AIDALAYER", "AttachedPolicies": []}),
@@ -14093,3 +14093,38 @@ def test_proxy_via_apigw_aws_proxy_integration(proxy_server):
     forwarded = json.loads(_ProxyHandler.received[-1]["body"])
     assert forwarded.get("rawPath") == "/hello"
     assert forwarded.get("requestContext", {}).get("http", {}).get("method") == "GET"
+
+
+def test_invoke_rie_reports_a_bare_string_timeout_as_a_function_error():
+    """RIE can end a run with a plain-text "Task timed out" body and HTTP 200.
+
+    That body is not JSON, so it reached callers as a successful payload:
+    Step Functions recorded TaskSucceeded and never ran Catch. It must take
+    the same shape as the read-timeout path.
+    """
+    from ministack.services.lambda_svc import _invoke_rie
+
+    class _FakeResp:
+        headers = {}
+
+        def read(self):
+            return b"Task timed out after 300.00 seconds"
+
+    with patch("urllib.request.urlopen", lambda req, timeout=None: _FakeResp()):
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=900)
+
+    assert result["error"] is True
+    assert result["function_error"] == "Unhandled"
+    assert result["body"] == {
+        "errorMessage": "Task timed out after 300.00 seconds",
+        "errorType": "Runtime.ExitError",
+    }
+    assert result["timeout"] is True
+
+
+def test_classify_function_error_bare_timeout_string_is_unhandled():
+    import ministack.services.lambda_svc as lsvc
+
+    assert lsvc._classify_function_error("Task timed out after 300.00 seconds", "") == "Unhandled"
+    # Only the exact runtime message counts; other handler strings stay successes.
+    assert lsvc._classify_function_error("the Task timed out after 3.00 seconds today", "") is None
