@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **CloudFormation — stack updates replace resources** — a change to a property the change set reports as `RequiresRecreation: Always` now creates a new resource under a new generated name, points its dependents at it and deletes the old one after the update succeeds (a rollback deletes the new one instead). With an explicit, unchanged name the update fails with the AWS message naming the physical id; this now also covers `AWS::Lambda::Function`. A named SQS queue or SNS topic fails with AWS's already-exists error instead and keeps its messages or subscriptions.
+
 ## [1.5.20] — 2026-10-01
 
 ### Added
