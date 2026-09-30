@@ -248,7 +248,6 @@ def _insufficient_capabilities_message(missing):
     return "Requires capabilities : [" + ", ".join(missing) + "]"
 
 
-
 # --- CreateStack ---
 
 def _create_stack(params):
