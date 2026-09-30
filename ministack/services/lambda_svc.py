@@ -3845,6 +3845,11 @@ def _docker_cp_dir(container, src_dir: str, dest_dir: str, arcname: str = "."):
     container.put_archive(dest_dir, buf)
 
 
+# Bare-text body the RIE answers with (HTTP 200) when a run hits the function
+# timeout (#1845); it is not a JSON error payload.
+_RIE_TIMEOUT_TEXT_RE = re.compile(r"Task timed out after \d+\.\d\d seconds")
+
+
 def _classify_function_error(parsed, err_header: str) -> str | None:
     """Classify an RIE response body/header as a function error.
 
@@ -3871,6 +3876,8 @@ def _classify_function_error(parsed, err_header: str) -> str | None:
     API Gateway keys its 502 contract off Unhandled.
     """
     if err_header:
+        return "Unhandled"
+    if isinstance(parsed, str) and _RIE_TIMEOUT_TEXT_RE.fullmatch(parsed):
         return "Unhandled"
     if not (isinstance(parsed, dict) and parsed.get("errorType")):
         return None
@@ -4008,6 +4015,10 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
             if function_error is not None:
                 result["error"] = True
                 result["function_error"] = function_error
+                if isinstance(parsed, str) and _RIE_TIMEOUT_TEXT_RE.fullmatch(parsed):
+                    # A bare timeout string: same shape as _rie_terminal_result.
+                    result["body"] = {"errorMessage": parsed, "errorType": "Runtime.ExitError"}
+                    result["timeout"] = True
             return result
         except (urllib.error.URLError, ConnectionRefusedError, OSError) as exc:
             if not _rie_failure_is_retryable(exc):
