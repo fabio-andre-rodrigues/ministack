@@ -498,7 +498,7 @@ subnet = ec2.create_subnet(
 | `AWS::Kinesis::Stream` | Stream name | Arn, StreamId |
 | `AWS::Glue::Database` | Database name | — |
 | `AWS::Glue::Table` | Table name | — |
-| `AWS::Glue::Partition` | Generated id | — |
+| `AWS::Glue::Partition` | `<catalog id>\|<database>\|<table>\|<values hash>` | IdentifierPartitionInputValues |
 | `AWS::Glue::Connection` | Connection name | Name |
 | `AWS::Glue::Crawler` | Crawler name | — |
 | `AWS::Glue::Job` | Job name | — |

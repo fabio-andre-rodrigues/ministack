@@ -10493,8 +10493,9 @@ def _firehose_delivery_stream_delete(physical_id, props):
 # Each type goes through glue.py's own control-plane functions, so a stack's
 # databases and tables are the catalog Athena and the Glue API read. Crawlers
 # and jobs are records only: a stack never starts a crawl or a job run. Ref
-# is the resource name for every type; the partition, which has none, gets a
-# generated id. Deletes ignore EntityNotFound, since deleting a database
+# is the resource name for every type except the partition, whose Ref is its
+# compound primary identifier. Create-only properties follow the published
+# registry schemas. Deletes ignore EntityNotFound, since deleting a database
 # already drops its tables and partitions.
 
 
@@ -10506,9 +10507,9 @@ def _glue_call(fn, data, resource_type, action):
 
 
 def _glue_sync_tags(arn, old_props, new_props, resource_type):
-    """Apply a Tags change through TagResource / UntagResource. The template
-    reference types Tags as a Tag list, while its own crawler example passes
-    a map; _tag_map reads both."""
+    """Apply a Tags change through TagResource / UntagResource. The registry
+    schemas type Tags as a map, while the template reference pages say Tag
+    list; _tag_map reads both."""
     old_tags = _tag_map(old_props.get("Tags"))
     new_tags = _tag_map(new_props.get("Tags"))
     removed = sorted(old_tags.keys() - new_tags.keys())
@@ -10528,7 +10529,9 @@ def _glue_reset_dropped(old_props, new_props, defaults):
 
 
 def _glue_database_name(logical_id, props, stack_name):
-    return ((props.get("DatabaseInput") or {}).get("Name") or props.get("DatabaseName")
+    # DatabaseName is the schema's primary identifier, so it wins over
+    # DatabaseInput.Name when both are given.
+    return (props.get("DatabaseName") or (props.get("DatabaseInput") or {}).get("Name")
             or _physical_name(stack_name, logical_id, lowercase=True, max_len=255))
 
 
@@ -10544,14 +10547,17 @@ def _glue_database_create(logical_id, props, stack_name):
 
 
 def _glue_database_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    # Glue has no rename, so a new database name is a new database.
-    name = _glue_database_name(logical_id or physical_id, new_props, stack_name)
-    current = physical_id if physical_id in _glue._databases else None
-    replaced = _rename_replacement(
-        physical_id, old_props, new_props, stack_name, logical_id, name, current,
-        _glue_database_create, _glue_database_delete)
-    if replaced:
-        return replaced
+    # The registry schema's only create-only property is DatabaseName, and its
+    # update handler is granted glue:UpdateDatabase but neither CreateDatabase
+    # nor DeleteDatabase: a DatabaseInput change, its Name included, updates
+    # the database in place under the same Ref.
+    declared = new_props.get("DatabaseName")
+    if physical_id not in _glue._databases or (declared and declared != physical_id):
+        created = _glue_database_create(logical_id or physical_id, new_props, stack_name)
+        if physical_id in _glue._databases and created[0] != physical_id:
+            _delete_predecessor(_glue_database_delete, physical_id, old_props)
+        return created
+    name = physical_id
     db_input = _glue_database_input(name, new_props)
     db_input.update(_glue_reset_dropped(
         old_props.get("DatabaseInput") or {}, db_input,
@@ -10626,25 +10632,41 @@ def _glue_partition_exists(props):
     return status < 400
 
 
+def _glue_partition_values_hash(props):
+    # The schema's IdentifierPartitionInputValues is "a hashed string
+    # equivalent to the partition values list"; AWS does not document the
+    # hash, so this one is the emulator's.
+    return hashlib.sha256(json.dumps(_glue_partition_values(props)).encode()).hexdigest()
+
+
+def _glue_partition_id(props):
+    # The schema's compound primary identifier, joined with "|" as Cloud
+    # Control documents for compound identifiers.
+    return "|".join((
+        str(props.get("CatalogId") or get_account_id()),
+        props.get("DatabaseName", ""), props.get("TableName", ""),
+        _glue_partition_values_hash(props),
+    ))
+
+
 def _glue_partition_create(logical_id, props, stack_name):
     _glue_call(_glue._create_partition, {
         "DatabaseName": props.get("DatabaseName", ""),
         "TableName": props.get("TableName", ""),
         "PartitionInput": props.get("PartitionInput") or {},
     }, "AWS::Glue::Partition", "create")
-    return _physical_name(stack_name, logical_id), {}
+    return _glue_partition_id(props), {
+        "IdentifierPartitionInputValues": _glue_partition_values_hash(props)}
 
 
 def _glue_partition_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    # DatabaseName and TableName are create-only. The generated id does not
-    # carry them, so a replacement keeps it and deletes the old partition
-    # explicitly. A Values change updates the partition in place.
-    table = f"{new_props.get('DatabaseName', '')}/{new_props.get('TableName', '')}"
-    old_table = f"{old_props.get('DatabaseName', '')}/{old_props.get('TableName', '')}"
+    # CatalogId, DatabaseName, TableName and PartitionInput.Values are
+    # create-only and all of them are in the id, so a new id is a replacement.
     replaced = _rename_replacement(
-        physical_id, old_props, new_props, stack_name, logical_id, table,
-        old_table if _glue_partition_exists(old_props) else None,
-        _glue_partition_create, _glue_partition_delete, delete_when_id_unchanged=True)
+        physical_id, old_props, new_props, stack_name, logical_id,
+        _glue_partition_id(new_props),
+        physical_id if _glue_partition_exists(old_props) else None,
+        _glue_partition_create, _glue_partition_delete)
     if replaced:
         return replaced
     result = _glue_call(_glue._batch_update_partition, {
@@ -10657,7 +10679,8 @@ def _glue_partition_update(physical_id, old_props, new_props, stack_name, logica
     }, "AWS::Glue::Partition", "update")
     if result.get("Errors"):
         raise ValueError(f"AWS::Glue::Partition update failed: {result['Errors']!r}")
-    return physical_id, {}
+    return physical_id, {
+        "IdentifierPartitionInputValues": _glue_partition_values_hash(new_props)}
 
 
 def _glue_partition_delete(physical_id, props):
@@ -11650,6 +11673,14 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
         "LayerName", "Content", "CompatibleRuntimes", "CompatibleArchitectures",
         "Description", "LicenseInfo",
     ),
+    # createOnlyProperties of the published registry schemas. Table,
+    # Partition and Connection are left out: the first replaces on a
+    # TableInput.Name change the schema does not list, and the other two have
+    # nested create-only members (PartitionInput/Values, ConnectionInput/Name).
+    "AWS::Glue::Database": ("DatabaseName",),
+    "AWS::Glue::Crawler": ("Name",),
+    "AWS::Glue::Job": ("Name",),
+    "AWS::Glue::Trigger": ("Name", "WorkflowName", "Type"),
 }
 
 

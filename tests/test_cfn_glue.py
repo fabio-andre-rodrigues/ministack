@@ -6,6 +6,8 @@ import uuid
 import pytest
 from botocore.exceptions import ClientError
 
+from ministack.services.cloudformation.stacks import _diff_resources
+
 _ROLE = "arn:aws:iam::000000000000:role/glue-cfn-role"
 _WAIT = {"Delay": 1, "MaxAttempts": 30}
 
@@ -130,7 +132,10 @@ def _data_lake(s, *, table_description="raw events", crawler_schedule=True,
         "Outputs": {
             key: {"Value": {"Ref": key}}
             for key in ("Db", "Events", "Day", "Jdbc", "Crawler", "Job", "Trigger")
-        } | {"JdbcName": {"Value": {"Fn::GetAtt": ["Jdbc", "Name"]}}},
+        } | {
+            "JdbcName": {"Value": {"Fn::GetAtt": ["Jdbc", "Name"]}},
+            "DayValues": {"Value": {"Fn::GetAtt": ["Day", "IdentifierPartitionInputValues"]}},
+        },
     }
 
 
@@ -147,7 +152,9 @@ def test_cfn_glue_data_lake_stack_create_and_delete(cfn, glue, sts):
     assert out["Crawler"] == crawler
     assert out["Job"] == job
     assert out["Trigger"] == trigger
-    assert out["Day"]
+    # The partition's Ref is its compound primary identifier joined with "|".
+    account = sts.get_caller_identity()["Account"]
+    assert out["Day"] == f"{account}|{db}|events|{out['DayValues']}"
 
     assert glue.get_database(Name=db)["Database"]["Description"] == "data lake"
     table = glue.get_table(DatabaseName=db, Name="events")["Table"]
@@ -215,6 +222,48 @@ def test_cfn_glue_table_rename_replaces(cfn, glue):
         assert glue.get_table(DatabaseName=db, Name="events_v2")["Table"]["Name"] == "events_v2"
         _not_found(lambda: glue.get_table(DatabaseName=db, Name="events"))
         glue.get_partition(DatabaseName=db, TableName="events_v2", PartitionValues=["2026-10-01"])
+    finally:
+        _delete(cfn, stack)
+
+
+def test_cfn_glue_partition_values_change_replaces(cfn, glue):
+    s = _suffix()
+    stack = f"glue-pv-{s}"
+    template = _data_lake(s)
+    _create(cfn, stack, template)
+    db = f"lake_{s}"
+    before = _outputs(cfn, stack)["Day"]
+    try:
+        template["Resources"]["Day"]["Properties"]["PartitionInput"]["Values"] = ["2026-10-02"]
+        _update(cfn, stack, template)
+        assert _outputs(cfn, stack)["Day"] != before
+        glue.get_partition(DatabaseName=db, TableName="events", PartitionValues=["2026-10-02"])
+        _not_found(lambda: glue.get_partition(
+            DatabaseName=db, TableName="events", PartitionValues=["2026-10-01"]))
+    finally:
+        _delete(cfn, stack)
+
+
+def test_cfn_glue_database_input_name_change_updates_in_place(cfn, glue):
+    s = _suffix()
+    stack = f"glue-dbn-{s}"
+
+    def template(name, description):
+        return {
+            "Resources": {"Db": {"Type": "AWS::Glue::Database", "Properties": {
+                "CatalogId": {"Ref": "AWS::AccountId"},
+                "DatabaseInput": {"Name": name, "Description": description}}}},
+            "Outputs": {"Db": {"Value": {"Ref": "Db"}}},
+        }
+
+    _create(cfn, stack, template(f"first_{s}", "one"))
+    try:
+        # DatabaseName is the type's only create-only property, so the
+        # database is updated, not replaced, and keeps its Ref.
+        _update(cfn, stack, template(f"second_{s}", "two"))
+        assert _outputs(cfn, stack)["Db"] == f"first_{s}"
+        assert glue.get_database(Name=f"first_{s}")["Database"]["Description"] == "two"
+        _not_found(lambda: glue.get_database(Name=f"second_{s}"))
     finally:
         _delete(cfn, stack)
 
@@ -298,3 +347,24 @@ def test_cfn_glue_generated_names(cfn, glue):
         assert glue.get_job(JobName=out["Job"])["Job"]["MaxRetries"] == 2
     finally:
         _delete(cfn, stack)
+
+
+# Expected values follow the createOnlyProperties of the published registry
+# schemas; they were not observed on an AWS change set.
+@pytest.mark.parametrize("rtype,old,new,expected", [
+    ("AWS::Glue::Database", {"DatabaseName": "a"}, {"DatabaseName": "b"}, "Always"),
+    ("AWS::Glue::Database", {"DatabaseInput": {"Name": "a"}}, {"DatabaseInput": {"Name": "b"}}, "Never"),
+    ("AWS::Glue::Job", {"Name": "a"}, {"Name": "b"}, "Always"),
+    ("AWS::Glue::Job", {"MaxRetries": 0}, {"MaxRetries": 1}, "Never"),
+    ("AWS::Glue::Trigger", {"Type": "ON_DEMAND"}, {"Type": "SCHEDULED"}, "Always"),
+    ("AWS::Glue::Crawler", {"Description": "a"}, {"Description": "b"}, "Never"),
+    ("AWS::Glue::Partition", {"TableName": "a"}, {"TableName": "b"}, "Conditionally"),
+])
+def test_cfn_glue_change_set_recreation(rtype, old, new, expected):
+    def tmpl(props):
+        return {"Resources": {"R": {"Type": rtype, "Properties": props}}}
+
+    change = _diff_resources(tmpl(old), tmpl(new))[0]["ResourceChange"]
+    targets = {d["Target"]["Name"]: d["Target"]["RequiresRecreation"]
+               for d in change.get("Details", []) if d["Target"].get("Name")}
+    assert set(targets.values()) == {expected}
