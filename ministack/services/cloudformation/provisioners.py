@@ -2007,6 +2007,8 @@ def _lambda_create(logical_id, props, stack_name):
         func["config"]["ImageUri"] = image_uri
         if props.get("ImageConfig"):
             func["config"]["ImageConfigResponse"] = {"ImageConfig": props["ImageConfig"]}
+    if props.get("CapacityProviderConfig"):
+        func["config"]["CapacityProviderConfig"] = props["CapacityProviderConfig"]
     replaced = name in _lambda_svc._functions
     _lambda_svc._functions[name] = func
     # On a stack UPDATE this re-provisions over an existing function; recycle the
@@ -3671,26 +3673,43 @@ def _lambda_permission_delete(physical_id, props, logical_id=None):
 
 # --- Lambda Version ---
 
-def _lambda_version_create(logical_id, props, stack_name):
+def _lambda_version_function(props):
+    """The target function and its name; FunctionScalingConfig needs a capacity provider."""
     func, func_name, _resource_arn, _qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
+    if func and props.get("FunctionScalingConfig") and not func["config"].get("CapacityProviderConfig"):
+        raise ValueError("FunctionScalingConfig can't be specified for this Lambda function type.")
+    return func, func_name
+
+
+def _lambda_version_create(logical_id, props, stack_name):
+    func, func_name = _lambda_version_function(props)
     if func:
-        import copy
-        ver_num = func["next_version"]
-        func["next_version"] = ver_num + 1
-        ver_str = str(ver_num)
-        ver_config = copy.deepcopy(func["config"])
-        ver_config["Version"] = ver_str
+        latest = max(func["versions"], key=int, default=None)
+        if latest and func["versions"][latest].get("function_revision") == func["config"]["RevisionId"]:
+            raise ValueError(
+                f"A version for this Lambda function exists ( {latest} ). "
+                "Modify the function to create a new version."
+            )
+        status, _headers, body = _lambda_svc._publish_version(
+            func_name, {"Description": props.get("Description")})
+        if status >= 400:
+            raise ValueError(f"AWS::Lambda::Version PublishVersion failed: {body.decode()}")
         # Ref on AWS::Lambda::Version returns the *qualified* ARN
         # (arn:...:function:name:version) — that qualifier is also what lets
         # the delete handler find the version it published.
-        ver_arn = f"{ver_config['FunctionArn']}:{ver_str}"
-        func["versions"][ver_str] = {
-            "config": ver_config,
-            "code_zip": func.get("code_zip"),
-        }
-        return ver_arn, {"Version": ver_str}
+        config = json.loads(body)
+        return config["FunctionArn"], {"Version": config["Version"]}
     ver_arn = f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}:1"
     return ver_arn, {"Version": "1"}
+
+
+def _lambda_version_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """FunctionScalingConfig updates in place; every other property publishes a new version."""
+    if ({k: v for k, v in old_props.items() if k != "FunctionScalingConfig"}
+            != {k: v for k, v in new_props.items() if k != "FunctionScalingConfig"}):
+        return _lambda_version_create(logical_id or physical_id, new_props, stack_name)
+    _lambda_version_function(new_props)
+    return physical_id, {"Version": physical_id.rsplit(":", 1)[-1]}
 
 
 def _lambda_version_delete(physical_id, props):
@@ -7337,22 +7356,44 @@ def _ec2_igw_delete(physical_id, props):
     _ec2._tags.pop(physical_id, None)
 
 
-def _ec2_vpc_gw_attach_create(logical_id, props, stack_name):
+def _ec2_vpc_gw_attachment(props):
+    """(gateway record, attachment, physical id) of an attachment's properties."""
     vpc_id = props.get("VpcId", "")
-    igw_id = props.get("InternetGatewayId", "")
-    igw = _ec2._internet_gateways.get(igw_id)
-    if igw:
-        igw["Attachments"] = [{"VpcId": vpc_id, "State": "available"}]
-    physical_id = f"{igw_id}|{vpc_id}"
+    if props.get("VpnGatewayId"):
+        return (_ec2._vpn_gateways.get(props["VpnGatewayId"]),
+                {"VpcId": vpc_id, "State": "attached"}, f"VGW|{vpc_id}")
+    return (_ec2._internet_gateways.get(props.get("InternetGatewayId", "")),
+            {"VpcId": vpc_id, "State": "available"}, f"IGW|{vpc_id}")
+
+
+def _ec2_vpc_gw_attach_create(logical_id, props, stack_name):
+    """Attach the gateway; a replaced attachment stays until its own delete."""
+    gateway, attachment, physical_id = _ec2_vpc_gw_attachment(props)
+    if gateway:
+        _ec2_vpc_gw_attach_delete(physical_id, props)
+        gateway["Attachments"].append(attachment)
+    return physical_id, {}
+
+
+def _ec2_vpc_gw_attach_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Swap the gateway in place; a changed VpcId or gateway type is a replacement."""
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        _ec2_vpc_gw_attachment(new_props)[2], _ec2_vpc_gw_attachment(old_props)[2],
+        _ec2_vpc_gw_attach_create, _ec2_vpc_gw_attach_delete,
+    )
+    if replaced is not None:
+        return replaced
+    _ec2_vpc_gw_attach_delete(physical_id, old_props)
+    _ec2_vpc_gw_attach_create(logical_id or physical_id, new_props, stack_name)
     return physical_id, {}
 
 
 def _ec2_vpc_gw_attach_delete(physical_id, props):
-    parts = physical_id.split("|")
-    if len(parts) == 2:
-        igw = _ec2._internet_gateways.get(parts[0])
-        if igw:
-            igw["Attachments"] = []
+    gateway, attachment, _ = _ec2_vpc_gw_attachment(props)
+    if gateway:
+        gateway["Attachments"] = [a for a in gateway.get("Attachments", [])
+                                  if a.get("VpcId") != attachment["VpcId"]]
 
 
 def _ec2_rtb_create(logical_id, props, stack_name):
@@ -11691,7 +11732,12 @@ _RESOURCE_HANDLERS = {
         "delete": _lambda_permission_delete,
         "delete_with_logical_id": True,
     },
-    "AWS::Lambda::Version": {"create": _lambda_version_create, "delete": _lambda_version_delete},
+    "AWS::Lambda::Version": {
+        "create": _lambda_version_create,
+        "update": _lambda_version_update,
+        "update_with_logical_id": True,
+        "delete": _lambda_version_delete,
+    },
     "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create, "update": _cfn_wait_condition_update},
     "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create, "delete": _cfn_wait_condition_handle_delete},
     "AWS::CloudFormation::Stack": {
@@ -11937,7 +11983,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _ec2_igw_delete,
     },
-    "AWS::EC2::VPCGatewayAttachment": {"create": _ec2_vpc_gw_attach_create, "delete": _ec2_vpc_gw_attach_delete},
+    "AWS::EC2::VPCGatewayAttachment": {
+        "create": _ec2_vpc_gw_attach_create,
+        "update": _ec2_vpc_gw_attach_update,
+        "update_with_logical_id": True,
+        "delete": _ec2_vpc_gw_attach_delete,
+    },
     "AWS::EC2::RouteTable": {
         "create": _ec2_rtb_create,
         "update": _ec2_rtb_update,
