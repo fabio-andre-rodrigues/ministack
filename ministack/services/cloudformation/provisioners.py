@@ -39,6 +39,7 @@ import ministack.services.ecs as _ecs
 import ministack.services.elasticache as _ec
 import ministack.services.eventbridge as _eb
 import ministack.services.firehose as _firehose
+import ministack.services.glue as _glue
 import ministack.services.iam as _iam
 import ministack.services.iot as _iot
 import ministack.services.kinesis as _kinesis
@@ -51,6 +52,7 @@ import ministack.services.route53 as _r53
 import ministack.services.s3 as _s3
 import ministack.services.s3tables as _s3tables
 import ministack.services.secretsmanager as _sm
+import ministack.services.servicediscovery as _sd
 import ministack.services.ses as _ses
 import ministack.services.ses_v2 as _ses_v2
 import ministack.services.sns as _sns
@@ -738,6 +740,15 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "UserId",
         "requires_replacement": lambda old, new: old.get("UserName") != new.get("UserName"),
     },
+    # Type and WorkflowName are "Update requires: Replacement" in the
+    # aws-resource-glue-trigger reference.
+    "AWS::Glue::Trigger": {
+        "name": "Name",
+        "requires_replacement": lambda old, new: (
+            old.get("Type") != new.get("Type")
+            or old.get("WorkflowName", "") != new.get("WorkflowName", "")
+        ),
+    },
 }
 
 
@@ -827,10 +838,11 @@ def _delete_predecessor(delete_fn, *args, **kwargs):
     retaining set): the engine then records the DELETE_SKIPPED event and the
     predecessor stays, as on AWS. Every update handler that creates the
     replacement itself removes the old resource through this, so the policy
-    cannot be forgotten at one site, with four exceptions. Three have a
-    deterministic generated name (the DynamoDB table, the Location tracker
-    and the IoT thing type): the replacement takes the name back, so there is
-    nothing left to retain. The fourth is the Lambda permission's degenerate ``Id`` branch,
+    cannot be forgotten at one site, with five exceptions. Four have a
+    deterministic generated name (the DynamoDB table, the Location tracker,
+    the IoT thing type and the Glue trigger): the replacement takes the name
+    back, so there is nothing left to retain. The fifth is the Lambda
+    permission's degenerate ``Id`` branch,
     which removes and re-puts one statement under a Sid that cannot change:
     the physical id is kept, nothing is replaced, and the policy does not
     apply.
@@ -1014,6 +1026,10 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::SSM::Parameter": ("Tags", "map"),
     "AWS::Scheduler::ScheduleGroup": ("Tags", "list"),
     "AWS::SecretsManager::Secret": ("Tags", "list"),
+    "AWS::ServiceDiscovery::HttpNamespace": ("Tags", "list"),
+    "AWS::ServiceDiscovery::PrivateDnsNamespace": ("Tags", "list"),
+    "AWS::ServiceDiscovery::PublicDnsNamespace": ("Tags", "list"),
+    "AWS::ServiceDiscovery::Service": ("Tags", "list"),
     "AWS::StepFunctions::StateMachine": ("Tags", "list"),
 }
 
@@ -2741,6 +2757,7 @@ def _appconfig_application_update(physical_id, old_props, new_props, stack_name,
 def _appconfig_application_delete(physical_id, props):
     _appconfig._applications.pop(physical_id, None)
     _appconfig._tags.pop(_appconfig._app_arn(physical_id), None)
+    _appconfig._drop_deployments(f"{physical_id}/")
 
 
 # --- AppConfig Environment ---
@@ -2802,6 +2819,7 @@ def _appconfig_environment_delete(physical_id, props):
     app_id = props.get("ApplicationId", "")
     _appconfig._environments.pop(f"{app_id}/{physical_id}", None)
     _appconfig._tags.pop(_appconfig._env_arn(app_id, physical_id), None)
+    _appconfig._drop_deployments(f"{app_id}/{physical_id}/")
 
 
 # --- AppConfig ConfigurationProfile ---
@@ -2878,6 +2896,7 @@ def _appconfig_configuration_profile_update(physical_id, old_props, new_props,
 def _appconfig_configuration_profile_delete(physical_id, props):
     app_id = props.get("ApplicationId", "")
     _appconfig._config_profiles.pop(f"{app_id}/{physical_id}", None)
+    _appconfig._hosted_version_counters.pop(f"{app_id}/{physical_id}", None)
     _appconfig._tags.pop(_appconfig._profile_arn(app_id, physical_id), None)
 
 
@@ -2895,20 +2914,16 @@ def _appconfig_hosted_version_create(logical_id, props, stack_name):
     # CDK / Fn::ToJsonString may pass parsed JSON; AWS wire shape is a string.
     if isinstance(content, (dict, list)):
         content = json.dumps(content)
-    existing = [
-        v for k, v in _appconfig._hosted_versions.items()
-        if k.startswith(f"{app_id}/{profile_id}/")
-    ]
-    version_number = len(existing) + 1
     # AWS optimistic-concurrency: if LatestVersionNumber is supplied, it must
-    # match the most-recent version_number — otherwise reject with a
+    # match the most-recent existing version — otherwise reject with a
     # ConflictException-shape error (mirrors real AppConfig's lock check).
+    latest = _appconfig._latest_hosted_version_number(app_id, profile_id)
     latest_lock = props.get("LatestVersionNumber")
-    if latest_lock is not None and int(latest_lock) != version_number - 1:
+    if latest_lock is not None and int(latest_lock) != latest:
         raise ValueError(
-            f"AWS::AppConfig::HostedConfigurationVersion LatestVersionNumber "
-            f"mismatch: supplied {latest_lock}, current latest is {version_number - 1}"
+            f"Expected latest version {latest_lock} does not match actual latest version {latest}"
         )
+    version_number = _appconfig._next_hosted_version_number(app_id, profile_id)
     _appconfig._hosted_versions[f"{app_id}/{profile_id}/{version_number}"] = {
         "ApplicationId": app_id,
         "ConfigurationProfileId": profile_id,
@@ -3041,18 +3056,6 @@ def _appconfig_deployment_create(logical_id, props, stack_name):
     # value on the AWS CFN page; we return the deploy_num as the physical id
     # so CDK templates that Ref a Deployment still resolve.
     return str(deploy_num), {"DeploymentNumber": deploy_num, "State": "COMPLETE"}
-
-
-def _appconfig_deployment_delete(physical_id, props):
-    app_id = props.get("ApplicationId", "")
-    env_id = props.get("EnvironmentId", "")
-    _appconfig._deployments.pop(f"{app_id}/{env_id}/{physical_id}", None)
-    deploy_arn = (
-        f"arn:aws:appconfig:{_appconfig.get_region()}:"
-        f"{_appconfig.get_account_id()}:application/{app_id}/"
-        f"environment/{env_id}/deployment/{physical_id}"
-    )
-    _appconfig._tags.pop(deploy_arn, None)
 
 
 # --- CloudWatch Logs LogGroup ---
@@ -7660,8 +7663,8 @@ def _ecs_service_create(logical_id, props, stack_name):
         "taskDefinition": props.get("TaskDefinition", ""),
         "desiredCount": props.get("DesiredCount", 1),
         "launchType": props.get("LaunchType", "EC2"),
-        "loadBalancers": props.get("LoadBalancers", []),
-        "networkConfiguration": props.get("NetworkConfiguration", {}),
+        "loadBalancers": _pascal_to_camel(props.get("LoadBalancers") or []),
+        "networkConfiguration": _pascal_to_camel(props.get("NetworkConfiguration") or {}),
         "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
     }
     deployment_configuration = _ecs_deployment_configuration(props)
@@ -7688,7 +7691,7 @@ def _ecs_service_update(physical_id, old_props, new_props, stack_name):
     }
     for cf_property, ecs_property in property_map.items():
         if new_props.get(cf_property) != old_props.get(cf_property):
-            request[ecs_property] = new_props.get(cf_property)
+            request[ecs_property] = _pascal_to_camel(new_props.get(cf_property))
 
     if (new_props.get("DeploymentConfiguration")
             != old_props.get("DeploymentConfiguration")):
@@ -8724,6 +8727,231 @@ def _elbv2_listener_rule_update(physical_id, old_props, new_props, stack_name,
     rule["Conditions"] = _flatten_listener_rule_conditions(new_props.get("Conditions") or [])
     rule["Actions"] = _elbv2_listener_actions(new_props, None, prop="Actions")
     return physical_id, {"RuleArn": physical_id}
+
+
+# ---------------------------------------------------------------------------
+# Cloud Map (AWS::ServiceDiscovery::*)
+#
+# Every handler goes through the servicediscovery module's own functions, so a
+# stack-created namespace gets its Route 53 hosted zone and a service or
+# instance the same record the API writes. Ref, Fn::GetAtt and the
+# replacement properties follow the CloudFormation Template Reference pages for
+# the five types. Tags are "Updates are not supported" on every taggable type,
+# so an update leaves them as created.
+# ---------------------------------------------------------------------------
+
+_SD_NAMESPACE_TYPES = {
+    "HTTP": "AWS::ServiceDiscovery::HttpNamespace",
+    "DNS_PRIVATE": "AWS::ServiceDiscovery::PrivateDnsNamespace",
+    "DNS_PUBLIC": "AWS::ServiceDiscovery::PublicDnsNamespace",
+}
+
+
+def _sd_result(response, what, missing_ok=False):
+    """The parsed body of a servicediscovery call, or ValueError naming
+    ``what``. With ``missing_ok`` a 404 (resource already gone) returns None."""
+    status, _, body = response
+    if status == 404 and missing_ok:
+        return None
+    if status >= 400:
+        raise ValueError(f"{what} failed: {body!r}")
+    return json.loads(body) if body else {}
+
+
+def _sd_soa_ttl(props):
+    return ((((props.get("Properties") or {}).get("DnsProperties") or {})
+             .get("SOA") or {}).get("TTL"))
+
+
+def _sd_namespace_attrs(namespace):
+    attrs = {"Id": namespace["Id"], "Arn": namespace["Arn"]}
+    zone_id = (namespace.get("Properties") or {}).get("DnsProperties", {}).get("HostedZoneId")
+    if zone_id:
+        attrs["HostedZoneId"] = zone_id
+    return attrs
+
+
+def _sd_namespace_create_for(ns_type):
+    """The create handler for one of the three namespace types."""
+    resource_type = _SD_NAMESPACE_TYPES[ns_type]
+
+    def create(logical_id, props, stack_name):
+        name = props.get("Name")
+        if not name:
+            raise ValueError(f"{resource_type} requires Name")
+        namespace, err = _sd._create_namespace_record(
+            name, ns_type, props.get("Description"), props.get("Tags"),
+            _sd_soa_ttl(props) if ns_type != "HTTP" else None,
+        )
+        if err:
+            raise ValueError(f"{resource_type} create failed: {err[2]!r}")
+        return namespace["Id"], _sd_namespace_attrs(namespace)
+
+    return create
+
+
+def _sd_namespace_update_for(ns_type):
+    """The update handler for one of the three namespace types. Name, and Vpc
+    on a private namespace, require replacement; the namespace id is
+    generated, so the new namespace is created before the old one is
+    removed. Description and the SOA TTL change in place."""
+    resource_type = _SD_NAMESPACE_TYPES[ns_type]
+    create = _sd_namespace_create_for(ns_type)
+
+    def update(physical_id, old_props, new_props, stack_name, logical_id=None):
+        namespace = _sd._namespaces.get(physical_id)
+        if (namespace is None or new_props.get("Name") != namespace["Name"]
+                or new_props.get("Vpc") != old_props.get("Vpc")):
+            created = create(logical_id or physical_id, new_props, stack_name)
+            if namespace is not None:
+                _delete_predecessor(_sd_namespace_delete, physical_id, old_props)
+            return created
+        change = {}
+        if "Description" in new_props or "Description" in old_props:
+            change["Description"] = new_props.get("Description")
+        ttl = _sd_soa_ttl(new_props)
+        if ttl is not None and ns_type != "HTTP":
+            change["Properties"] = {"DnsProperties": {"SOA": {"TTL": ttl}}}
+        if change:
+            _sd_result(_sd._update_namespace({"Id": physical_id, "Namespace": change}),
+                       f"{resource_type} update")
+        return physical_id, _sd_namespace_attrs(namespace)
+
+    return update
+
+
+def _sd_namespace_delete(physical_id, props):
+    _sd_result(_sd._delete_namespace({"Id": physical_id}),
+               "AWS::ServiceDiscovery namespace delete", missing_ok=True)
+
+
+# UpdateService's members, each reverting to None when the template drops it.
+_SD_SERVICE_UPDATABLE = {"Description": None, "DnsConfig": None, "HealthCheckConfig": None}
+
+
+def _sd_string_map(values):
+    """A Cloud Map attribute map: string keys and string values."""
+    return {str(k): str(v) for k, v in (values or {}).items()}
+
+
+def _sd_service_name(props, stack_name, logical_id):
+    # Inference: AWS documents no format for a generated service name; a
+    # Cloud Map DNS label is at most 63 characters.
+    return props.get("Name") or _physical_name(stack_name, logical_id, max_len=63)
+
+
+def _sd_service_namespace_id(props):
+    return props.get("NamespaceId") or (props.get("DnsConfig") or {}).get("NamespaceId")
+
+
+def _sd_service_attrs(service):
+    return {"Id": service["Id"], "Arn": service["Arn"], "Name": service["Name"]}
+
+
+def _sd_service_create(logical_id, props, stack_name):
+    payload = {
+        key: props[key]
+        for key in ("Description", "DnsConfig", "HealthCheckConfig", "HealthCheckCustomConfig", "Tags")
+        if key in props
+    }
+    payload["Name"] = _sd_service_name(props, stack_name, logical_id)
+    payload["NamespaceId"] = _sd_service_namespace_id(props)
+    service = _sd_result(_sd._create_service(payload),
+                         "AWS::ServiceDiscovery::Service create")["Service"]
+    if props.get("ServiceAttributes"):
+        _sd_result(_sd._update_service_attributes({
+            "ServiceId": service["Id"],
+            "Attributes": _sd_string_map(props["ServiceAttributes"]),
+        }), "AWS::ServiceDiscovery::Service ServiceAttributes")
+    return service["Id"], _sd_service_attrs(service)
+
+
+def _sd_service_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Name, NamespaceId, Type and HealthCheckCustomConfig require
+    replacement; the service id is generated, so the new service is created
+    before the old one is removed. Description, DnsConfig, HealthCheckConfig
+    and ServiceAttributes change in place."""
+    logical_id = logical_id or physical_id
+    service = _sd._services.get(physical_id)
+    if (service is None
+            or _sd_service_name(new_props, stack_name, logical_id) != service["Name"]
+            or _sd_service_namespace_id(new_props) != service["NamespaceId"]
+            or new_props.get("Type") != old_props.get("Type")
+            or new_props.get("HealthCheckCustomConfig") != old_props.get("HealthCheckCustomConfig")):
+        created = _sd_service_create(logical_id, new_props, stack_name)
+        if service is not None:
+            _delete_predecessor(_sd_service_delete, physical_id, old_props)
+        return created
+    change = _declared_or_default(old_props, new_props, _SD_SERVICE_UPDATABLE)
+    if change:
+        _sd_result(_sd._update_service({"Id": physical_id, "Service": change}),
+                   "AWS::ServiceDiscovery::Service update")
+    old_attrs = _sd_string_map(old_props.get("ServiceAttributes"))
+    new_attrs = _sd_string_map(new_props.get("ServiceAttributes"))
+    dropped = sorted(old_attrs.keys() - new_attrs.keys())
+    if dropped:
+        _sd_result(_sd._delete_service_attributes({"ServiceId": physical_id, "Attributes": dropped}),
+                   "AWS::ServiceDiscovery::Service ServiceAttributes")
+    if new_attrs and new_attrs != old_attrs:
+        _sd_result(_sd._update_service_attributes({"ServiceId": physical_id, "Attributes": new_attrs}),
+                   "AWS::ServiceDiscovery::Service ServiceAttributes")
+    return physical_id, _sd_service_attrs(service)
+
+
+def _sd_service_delete(physical_id, props):
+    _sd_result(_sd._delete_service({"Id": physical_id}),
+               "AWS::ServiceDiscovery::Service delete", missing_ok=True)
+
+
+def _sd_instance_id(props, stack_name, logical_id):
+    # Inference: AWS documents no format for a generated instance id.
+    return props.get("InstanceId") or _physical_name(stack_name, logical_id, max_len=64)
+
+
+def _sd_register_instance(instance_id, props):
+    _sd_result(_sd._register_instance({
+        "ServiceId": props.get("ServiceId", ""),
+        "InstanceId": instance_id,
+        "Attributes": _sd_string_map(props.get("InstanceAttributes")),
+    }), "AWS::ServiceDiscovery::Instance register")
+
+
+def _sd_instance_create(logical_id, props, stack_name):
+    """Register the instance. An id already registered in the service is
+    refused, so a template cannot take over an instance registered outside
+    the stack (inference: RegisterInstance upserts, and AWS documents no
+    CloudFormation behaviour for an existing id)."""
+    instance_id = _sd_instance_id(props, stack_name, logical_id)
+    service_id = props.get("ServiceId", "")
+    if instance_id in _sd._instances.get(service_id, {}):
+        raise ValueError(
+            f"AWS::ServiceDiscovery::Instance {instance_id} is already registered "
+            f"in service {service_id}"
+        )
+    _sd_register_instance(instance_id, props)
+    return instance_id, {}
+
+
+def _sd_instance_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """InstanceId and ServiceId require replacement. A ServiceId change keeps
+    a user-chosen InstanceId, so the predecessor delete is queued even when
+    the physical id is unchanged; the engine treats that as a replacement.
+    InstanceAttributes re-register the instance in place."""
+    logical_id = logical_id or physical_id
+    instance_id = _sd_instance_id(new_props, stack_name, logical_id)
+    if instance_id != physical_id or new_props.get("ServiceId") != old_props.get("ServiceId"):
+        created = _sd_instance_create(logical_id, new_props, stack_name)
+        _delete_predecessor(_sd_instance_delete, physical_id, old_props)
+        return created
+    _sd_register_instance(physical_id, new_props)
+    return physical_id, {}
+
+
+def _sd_instance_delete(physical_id, props):
+    _sd_result(_sd._deregister_instance({
+        "ServiceId": props.get("ServiceId", ""),
+        "InstanceId": physical_id,
+    }), "AWS::ServiceDiscovery::Instance deregister", missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -10591,6 +10819,27 @@ def _ec_call(fn, params, resource_type, action):
 
 
 def _ec_sync_tags(arn, old_props, new_props, resource_type):
+# --- Glue Data Catalog, connections, crawlers, jobs and triggers (#1875) ---
+# Each type goes through glue.py's own control-plane functions, so a stack's
+# databases and tables are the catalog Athena and the Glue API read. Crawlers
+# and jobs are records only: a stack never starts a crawl or a job run. Ref
+# is the resource name for every type except the partition, whose Ref is its
+# compound primary identifier. Create-only properties follow the published
+# registry schemas. Deletes ignore EntityNotFound, since deleting a database
+# already drops its tables and partitions.
+
+
+def _glue_call(fn, data, resource_type, action):
+    status, _headers, body = fn(data)
+    if status >= 400:
+        raise ValueError(f"{resource_type} {action} failed: {body!r}")
+    return json.loads(body or b"{}")
+
+
+def _glue_sync_tags(arn, old_props, new_props, resource_type):
+    """Apply a Tags change through TagResource / UntagResource. The registry
+    schemas type Tags as a map, while the template reference pages say Tag
+    list; _tag_map reads both."""
     old_tags = _tag_map(old_props.get("Tags"))
     new_tags = _tag_map(new_props.get("Tags"))
     removed = sorted(old_tags.keys() - new_tags.keys())
@@ -10983,6 +11232,356 @@ def _ec_user_group_update(physical_id, old_props, new_props, stack_name, logical
 
 def _ec_user_group_delete(physical_id, props):
     _ec._delete_user_group({"UserGroupId": physical_id})
+        _glue_call(_glue._untag_resource, {"ResourceArn": arn, "TagsToRemove": removed},
+                   resource_type, "untag")
+    if new_tags and new_tags != old_tags:
+        _glue_call(_glue._tag_resource, {"ResourceArn": arn, "TagsToAdd": new_tags},
+                   resource_type, "tag")
+
+
+def _glue_reset_dropped(old_props, new_props, defaults):
+    """The update payload entries for properties the new template dropped.
+    glue.py's Update* calls change only the members they are given, so a
+    removed property would otherwise keep its old value."""
+    return {k: v for k, v in defaults.items() if k in old_props and k not in new_props}
+
+
+def _glue_database_name(logical_id, props, stack_name):
+    # DatabaseName is the schema's primary identifier, so it wins over
+    # DatabaseInput.Name when both are given.
+    return (props.get("DatabaseName") or (props.get("DatabaseInput") or {}).get("Name")
+            or _physical_name(stack_name, logical_id, lowercase=True, max_len=255))
+
+
+def _glue_database_input(name, props):
+    return {**(props.get("DatabaseInput") or {}), "Name": name}
+
+
+def _glue_database_create(logical_id, props, stack_name):
+    name = _glue_database_name(logical_id, props, stack_name)
+    _glue_call(_glue._create_database, {"DatabaseInput": _glue_database_input(name, props)},
+               "AWS::Glue::Database", "create")
+    return name, {}
+
+
+def _glue_database_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    # The registry schema's only create-only property is DatabaseName, and its
+    # update handler is granted glue:UpdateDatabase but neither CreateDatabase
+    # nor DeleteDatabase: a DatabaseInput change, its Name included, updates
+    # the database in place under the same Ref.
+    declared = new_props.get("DatabaseName")
+    if physical_id not in _glue._databases or (declared and declared != physical_id):
+        created = _glue_database_create(logical_id or physical_id, new_props, stack_name)
+        if physical_id in _glue._databases and created[0] != physical_id:
+            _delete_predecessor(_glue_database_delete, physical_id, old_props)
+        return created
+    name = physical_id
+    db_input = _glue_database_input(name, new_props)
+    db_input.update(_glue_reset_dropped(
+        old_props.get("DatabaseInput") or {}, db_input,
+        {"Description": "", "LocationUri": None, "Parameters": {}}))
+    _glue_call(_glue._update_database, {"Name": name, "DatabaseInput": db_input},
+               "AWS::Glue::Database", "update")
+    return name, {}
+
+
+def _glue_database_delete(physical_id, props):
+    _glue._delete_database({"Name": physical_id})
+
+
+def _glue_table_name(logical_id, props, stack_name):
+    return ((props.get("TableInput") or {}).get("Name") or props.get("Name")
+            or _physical_name(stack_name, logical_id, lowercase=True, max_len=255))
+
+
+def _glue_table_request(name, props):
+    data = {
+        "DatabaseName": props.get("DatabaseName", ""),
+        "TableInput": {**(props.get("TableInput") or {}), "Name": name},
+    }
+    if props.get("OpenTableFormatInput"):
+        data["OpenTableFormatInput"] = props["OpenTableFormatInput"]
+    return data
+
+
+def _glue_table_create(logical_id, props, stack_name):
+    name = _glue_table_name(logical_id, props, stack_name)
+    _glue_call(_glue._create_table, _glue_table_request(name, props),
+               "AWS::Glue::Table", "create")
+    return name, {}
+
+
+def _glue_table_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    # A table is identified by database and name: changing either replaces it,
+    # and moving databases keeps the physical id, so the old table is deleted
+    # explicitly.
+    name = _glue_table_name(logical_id or physical_id, new_props, stack_name)
+    old_key = f"{old_props.get('DatabaseName', '')}/{physical_id}"
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        f"{new_props.get('DatabaseName', '')}/{name}",
+        old_key if old_key in _glue._tables else None,
+        _glue_table_create, _glue_table_delete, delete_when_id_unchanged=True)
+    if replaced:
+        return replaced
+    data = _glue_table_request(name, new_props)
+    data["TableInput"].update(_glue_reset_dropped(
+        old_props.get("TableInput") or {}, data["TableInput"],
+        {"Description": "", "Owner": "", "StorageDescriptor": {}, "PartitionKeys": [],
+         "Parameters": {}, "ViewOriginalText": None, "ViewExpandedText": None}))
+    _glue_call(_glue._update_table, data, "AWS::Glue::Table", "update")
+    return name, {}
+
+
+def _glue_table_delete(physical_id, props):
+    _glue._delete_table({"DatabaseName": props.get("DatabaseName", ""), "Name": physical_id})
+
+
+def _glue_partition_values(props):
+    return (props.get("PartitionInput") or {}).get("Values", [])
+
+
+def _glue_partition_exists(props):
+    status, _headers, _body = _glue._get_partition({
+        "DatabaseName": props.get("DatabaseName", ""),
+        "TableName": props.get("TableName", ""),
+        "PartitionValues": _glue_partition_values(props),
+    })
+    return status < 400
+
+
+def _glue_partition_values_hash(props):
+    # The schema's IdentifierPartitionInputValues is "a hashed string
+    # equivalent to the partition values list"; AWS does not document the
+    # hash, so this one is the emulator's.
+    return hashlib.sha256(json.dumps(_glue_partition_values(props)).encode()).hexdigest()
+
+
+def _glue_partition_id(props):
+    # The schema's compound primary identifier, joined with "|" as Cloud
+    # Control documents for compound identifiers.
+    return "|".join((
+        str(props.get("CatalogId") or get_account_id()),
+        props.get("DatabaseName", ""), props.get("TableName", ""),
+        _glue_partition_values_hash(props),
+    ))
+
+
+def _glue_partition_create(logical_id, props, stack_name):
+    _glue_call(_glue._create_partition, {
+        "DatabaseName": props.get("DatabaseName", ""),
+        "TableName": props.get("TableName", ""),
+        "PartitionInput": props.get("PartitionInput") or {},
+    }, "AWS::Glue::Partition", "create")
+    return _glue_partition_id(props), {
+        "IdentifierPartitionInputValues": _glue_partition_values_hash(props)}
+
+
+def _glue_partition_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    # CatalogId, DatabaseName, TableName and PartitionInput.Values are
+    # create-only and all of them are in the id, so a new id is a replacement.
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        _glue_partition_id(new_props),
+        physical_id if _glue_partition_exists(old_props) else None,
+        _glue_partition_create, _glue_partition_delete)
+    if replaced:
+        return replaced
+    result = _glue_call(_glue._batch_update_partition, {
+        "DatabaseName": new_props.get("DatabaseName", ""),
+        "TableName": new_props.get("TableName", ""),
+        "Entries": [{
+            "PartitionValueList": _glue_partition_values(old_props),
+            "PartitionInput": new_props.get("PartitionInput") or {},
+        }],
+    }, "AWS::Glue::Partition", "update")
+    if result.get("Errors"):
+        raise ValueError(f"AWS::Glue::Partition update failed: {result['Errors']!r}")
+    return physical_id, {
+        "IdentifierPartitionInputValues": _glue_partition_values_hash(new_props)}
+
+
+def _glue_partition_delete(physical_id, props):
+    _glue._delete_partition({
+        "DatabaseName": props.get("DatabaseName", ""),
+        "TableName": props.get("TableName", ""),
+        "PartitionValues": _glue_partition_values(props),
+    })
+
+
+def _glue_connection_name(logical_id, props, stack_name):
+    return ((props.get("ConnectionInput") or {}).get("Name")
+            or _physical_name(stack_name, logical_id, max_len=255))
+
+
+def _glue_connection_create(logical_id, props, stack_name):
+    name = _glue_connection_name(logical_id, props, stack_name)
+    conn_input = {**(props.get("ConnectionInput") or {}), "Name": name}
+    _glue_call(_glue._create_connection, {"ConnectionInput": conn_input},
+               "AWS::Glue::Connection", "create")
+    _glue_sync_tags(_glue._arn("connection", name), {}, props, "AWS::Glue::Connection")
+    return name, {"Name": name}
+
+
+def _glue_connection_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    name = _glue_connection_name(logical_id or physical_id, new_props, stack_name)
+    current = _glue._connections.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id, name,
+        physical_id if current is not None else None,
+        _glue_connection_create, _glue_connection_delete)
+    if replaced:
+        return replaced
+    # glue.py has no UpdateConnection: the record is rewritten from the new
+    # ConnectionInput, keeping its creation time.
+    _glue._connections[name] = {
+        **(new_props.get("ConnectionInput") or {}), "Name": name,
+        "CreationTime": current.get("CreationTime", int(time.time())),
+        "LastUpdatedTime": int(time.time()),
+    }
+    _glue_sync_tags(_glue._arn("connection", name), old_props, new_props,
+                    "AWS::Glue::Connection")
+    return name, {"Name": name}
+
+
+def _glue_connection_delete(physical_id, props):
+    _glue._delete_connection({"ConnectionName": physical_id})
+    _glue._tags.pop(_glue._arn("connection", physical_id), None)
+
+
+_GLUE_CRAWLER_DEFAULTS = {
+    "DatabaseName": "", "Description": "", "Schedule": {}, "Classifiers": [],
+    "TablePrefix": "", "SchemaChangePolicy": {}, "RecrawlPolicy": {},
+    "LineageConfiguration": {}, "Configuration": "", "CrawlerSecurityConfiguration": "",
+}
+
+
+def _glue_crawler_request(name, props):
+    data = {k: props[k] for k in ("Role", "Targets", *_GLUE_CRAWLER_DEFAULTS) if k in props}
+    # The template's Schedule is a {ScheduleExpression} object; CreateCrawler
+    # takes the expression string.
+    schedule = props.get("Schedule")
+    if isinstance(schedule, dict):
+        data["Schedule"] = schedule.get("ScheduleExpression", "")
+    data["Name"] = name
+    return data
+
+
+def _glue_crawler_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=255)
+    _glue_call(_glue._create_crawler, _glue_crawler_request(name, props),
+               "AWS::Glue::Crawler", "create")
+    _glue_sync_tags(_glue._arn("crawler", name), {}, props, "AWS::Glue::Crawler")
+    return name, {}
+
+
+def _glue_crawler_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    name = new_props.get("Name") or _physical_name(stack_name, logical_id or physical_id, max_len=255)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id, name,
+        physical_id if physical_id in _glue._crawlers else None,
+        _glue_crawler_create, _glue_crawler_delete)
+    if replaced:
+        return replaced
+    data = _glue_crawler_request(name, new_props)
+    data.update(_glue_reset_dropped(old_props, new_props, _GLUE_CRAWLER_DEFAULTS))
+    _glue_call(_glue._update_crawler, data, "AWS::Glue::Crawler", "update")
+    _glue_sync_tags(_glue._arn("crawler", name), old_props, new_props, "AWS::Glue::Crawler")
+    return name, {}
+
+
+def _glue_crawler_delete(physical_id, props):
+    _glue._delete_crawler({"Name": physical_id})
+    _glue._tags.pop(_glue._arn("crawler", physical_id), None)
+
+
+_GLUE_JOB_DEFAULTS = {
+    "Description": "", "DefaultArguments": {}, "NonOverridableArguments": {},
+    "Connections": {}, "MaxRetries": 0, "Timeout": 2880, "GlueVersion": "3.0",
+    "NumberOfWorkers": 2, "WorkerType": "G.1X", "MaxCapacity": None,
+    "SecurityConfiguration": "",
+}
+
+
+def _glue_job_fields(props):
+    return {k: props[k] for k in ("Role", "Command", *_GLUE_JOB_DEFAULTS) if k in props}
+
+
+def _glue_job_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=255)
+    data = {**_glue_job_fields(props), "Name": name}
+    if props.get("Tags"):
+        data["Tags"] = _tag_map(props["Tags"])
+    _glue_call(_glue._create_job, data, "AWS::Glue::Job", "create")
+    _glue_sync_tags(_glue._arn("job", name), {}, props, "AWS::Glue::Job")
+    return name, {}
+
+
+def _glue_job_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    name = new_props.get("Name") or _physical_name(stack_name, logical_id or physical_id, max_len=255)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id, name,
+        physical_id if physical_id in _glue._jobs else None,
+        _glue_job_create, _glue_job_delete)
+    if replaced:
+        return replaced
+    job_update = _glue_job_fields(new_props)
+    job_update.update(_glue_reset_dropped(old_props, new_props, _GLUE_JOB_DEFAULTS))
+    _glue_call(_glue._update_job, {"JobName": name, "JobUpdate": job_update},
+               "AWS::Glue::Job", "update")
+    _glue_sync_tags(_glue._arn("job", name), old_props, new_props, "AWS::Glue::Job")
+    return name, {}
+
+
+def _glue_job_delete(physical_id, props):
+    _glue._delete_job({"JobName": physical_id})
+    _glue._tags.pop(_glue._arn("job", physical_id), None)
+
+
+_GLUE_TRIGGER_DEFAULTS = {"Schedule": "", "Predicate": {}, "Description": ""}
+
+
+def _glue_trigger_name(logical_id, props, stack_name):
+    return props.get("Name") or _physical_name(stack_name, logical_id, max_len=255)
+
+
+def _glue_trigger_create(logical_id, props, stack_name):
+    name = _glue_trigger_name(logical_id, props, stack_name)
+    data = {k: props[k] for k in ("Type", "Actions", "WorkflowName", *_GLUE_TRIGGER_DEFAULTS)
+            if k in props}
+    data["Name"] = name
+    data["StartOnCreation"] = _cfn_bool(props.get("StartOnCreation", False))
+    if props.get("Tags"):
+        data["Tags"] = _tag_map(props["Tags"])
+    _glue_call(_glue._create_trigger, data, "AWS::Glue::Trigger", "create")
+    return name, {}
+
+
+def _glue_trigger_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    name = _glue_trigger_name(logical_id or physical_id, new_props, stack_name)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id, name,
+        physical_id if physical_id in _glue._triggers else None,
+        _glue_trigger_create, _glue_trigger_delete)
+    if replaced:
+        return replaced
+    if _requires_replacement("AWS::Glue::Trigger", old_props, new_props):
+        # Type and WorkflowName are create-only. An explicit Name is refused
+        # above the handler; a generated one is taken back by the replacement,
+        # so the old trigger goes first and there is nothing left to retain.
+        _glue_trigger_delete(physical_id, old_props)
+        return _glue_trigger_create(logical_id or physical_id, new_props, stack_name)
+    trigger_update = {k: new_props[k] for k in ("Actions", *_GLUE_TRIGGER_DEFAULTS)
+                      if k in new_props}
+    trigger_update.update(_glue_reset_dropped(old_props, new_props, _GLUE_TRIGGER_DEFAULTS))
+    _glue_call(_glue._update_trigger, {"Name": name, "TriggerUpdate": trigger_update},
+               "AWS::Glue::Trigger", "update")
+    _glue_sync_tags(_glue._arn("trigger", name), old_props, new_props, "AWS::Glue::Trigger")
+    return name, {}
+
+
+def _glue_trigger_delete(physical_id, props):
+    _glue._delete_trigger({"Name": physical_id})
 
 
 # --- IoT ThingType / Policy, Cognito IdentityPoolRoleAttachment,
@@ -11126,7 +11725,9 @@ def _iot_thing_group_update(physical_id, old_props, new_props, stack_name, logic
 def _iot_thing_group_delete(physical_id, props):
     rec = _iot_thing_group_record(physical_id)
     if rec is not None:
-        _iot._delete_thing_group(rec["thingGroupName"])
+        resp = _iot._delete_thing_group(rec["thingGroupName"])
+        if resp[0] >= 400:
+            raise ValueError(f"AWS::IoT::ThingGroup delete failed: {resp[2]!r}")
 
 
 def _iot_policy_document(props):
@@ -11806,6 +12407,14 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     ),
     "AWS::ElastiCache::User": ("UserId", "UserName"),
     "AWS::ElastiCache::UserGroup": ("UserGroupId",),
+    # createOnlyProperties of the published registry schemas. Table,
+    # Partition and Connection are left out: the first replaces on a
+    # TableInput.Name change the schema does not list, and the other two have
+    # nested create-only members (PartitionInput/Values, ConnectionInput/Name).
+    "AWS::Glue::Database": ("DatabaseName",),
+    "AWS::Glue::Crawler": ("Name",),
+    "AWS::Glue::Job": ("Name",),
+    "AWS::Glue::Trigger": ("Name", "WorkflowName", "Type"),
 }
 
 
@@ -11879,6 +12488,47 @@ _RESOURCE_HANDLERS = {
         "update": _ec_user_group_update,
         "update_with_logical_id": True,
         "delete": _ec_user_group_delete,
+    "AWS::Glue::Database": {
+        "create": _glue_database_create,
+        "update": _glue_database_update,
+        "update_with_logical_id": True,
+        "delete": _glue_database_delete,
+    },
+    "AWS::Glue::Table": {
+        "create": _glue_table_create,
+        "update": _glue_table_update,
+        "update_with_logical_id": True,
+        "delete": _glue_table_delete,
+    },
+    "AWS::Glue::Partition": {
+        "create": _glue_partition_create,
+        "update": _glue_partition_update,
+        "update_with_logical_id": True,
+        "delete": _glue_partition_delete,
+    },
+    "AWS::Glue::Connection": {
+        "create": _glue_connection_create,
+        "update": _glue_connection_update,
+        "update_with_logical_id": True,
+        "delete": _glue_connection_delete,
+    },
+    "AWS::Glue::Crawler": {
+        "create": _glue_crawler_create,
+        "update": _glue_crawler_update,
+        "update_with_logical_id": True,
+        "delete": _glue_crawler_delete,
+    },
+    "AWS::Glue::Job": {
+        "create": _glue_job_create,
+        "update": _glue_job_update,
+        "update_with_logical_id": True,
+        "delete": _glue_job_delete,
+    },
+    "AWS::Glue::Trigger": {
+        "create": _glue_trigger_create,
+        "update": _glue_trigger_update,
+        "update_with_logical_id": True,
+        "delete": _glue_trigger_delete,
     },
     "AWS::S3Tables::TableBucket": {
         "create": _s3tables_bucket_create,
@@ -11982,7 +12632,8 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::AppConfig::Deployment": {
         "create": _appconfig_deployment_create,
-        "delete": _appconfig_deployment_delete,
+        # A deleted deployment stays in ListDeployments, and its number stays taken.
+        "delete": _cfn_noop_delete,
     },
     "AWS::Logs::LogGroup": {
         "create": _cwlogs_create,
@@ -12334,6 +12985,36 @@ _RESOURCE_HANDLERS = {
         "delete": _r53_hosted_zone_delete,
     },
     "AWS::Route53::RecordSet": {"create": _r53_record_set_create, "update": _r53_record_set_update, "delete": _r53_record_set_delete},
+    "AWS::ServiceDiscovery::HttpNamespace": {
+        "create": _sd_namespace_create_for("HTTP"),
+        "update": _sd_namespace_update_for("HTTP"),
+        "update_with_logical_id": True,
+        "delete": _sd_namespace_delete,
+    },
+    "AWS::ServiceDiscovery::PrivateDnsNamespace": {
+        "create": _sd_namespace_create_for("DNS_PRIVATE"),
+        "update": _sd_namespace_update_for("DNS_PRIVATE"),
+        "update_with_logical_id": True,
+        "delete": _sd_namespace_delete,
+    },
+    "AWS::ServiceDiscovery::PublicDnsNamespace": {
+        "create": _sd_namespace_create_for("DNS_PUBLIC"),
+        "update": _sd_namespace_update_for("DNS_PUBLIC"),
+        "update_with_logical_id": True,
+        "delete": _sd_namespace_delete,
+    },
+    "AWS::ServiceDiscovery::Service": {
+        "create": _sd_service_create,
+        "update": _sd_service_update,
+        "update_with_logical_id": True,
+        "delete": _sd_service_delete,
+    },
+    "AWS::ServiceDiscovery::Instance": {
+        "create": _sd_instance_create,
+        "update": _sd_instance_update,
+        "update_with_logical_id": True,
+        "delete": _sd_instance_delete,
+    },
     "AWS::ApiGatewayV2::Api": {
         "create": _apigw_v2_api_create,
         "update": _apigw_v2_api_update,
