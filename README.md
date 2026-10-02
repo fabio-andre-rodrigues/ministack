@@ -1549,7 +1549,7 @@ LocalStack also sells an Enterprise plan with custom pricing, air-gapped deliver
 
 ### Service coverage by LocalStack plan
 
-A ✅ under a LocalStack plan means LocalStack's plans page lists the service for that plan. "Not listed" services (last five rows) show ❌ because the page does not mention them. This table compares which services exist on each side. It does not compare operation-level depth. LocalStack has had longer to cover individual APIs, and MiniStack has not benchmarked itself against it operation by operation.
+✅ means the service is available. ❌ means it is not available, or not listed on LocalStack's plans page. The table covers which services exist, not how many operations each supports.
 
 | Service | MiniStack | LocalStack Hobby (free) | LocalStack Base | LocalStack Ultimate |
 |---------|-----------|------------------|-----------------|---------------------|
