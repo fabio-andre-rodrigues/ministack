@@ -14,6 +14,7 @@ Supports:
                   CreateTags (legacy), DeleteTags (legacy), DescribeTags (legacy)
   Lifecycle:      PutLifecycleConfiguration, DescribeLifecycleConfiguration
   Backup Policy:  PutBackupPolicy, DescribeBackupPolicy
+  FS Policy:      PutFileSystemPolicy, DescribeFileSystemPolicy, DeleteFileSystemPolicy
   Account:        DescribeAccountPreferences, PutAccountPreferences
 """
 
@@ -102,6 +103,8 @@ def _create_file_system(body):
     }
     if provisioned_throughput:
         record["ProvisionedThroughputInMibps"] = provisioned_throughput
+    if body.get("AvailabilityZoneName"):
+        record["AvailabilityZoneName"] = body["AvailabilityZoneName"]
 
     _file_systems[fs_id] = record
     return _json(201, _fs_response(record))
@@ -134,6 +137,8 @@ def _delete_file_system(fs_id):
         return _error(400, "FileSystemInUse",
                       f"File system '{fs_id}' has mount targets and cannot be deleted.")
     del _file_systems[fs_id]
+    _lifecycle_configs.pop(fs_id, None)
+    _backup_policies.pop(fs_id, None)
     return _json(204, {})
 
 
@@ -149,8 +154,7 @@ def _update_file_system(fs_id, body):
 
 
 def _fs_response(fs):
-    r = {k: v for k, v in fs.items()}
-    return r
+    return {k: v for k, v in fs.items() if k != "FileSystemPolicy"}
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +494,35 @@ def _describe_backup_policy(fs_id):
     return _json(200, {"BackupPolicy": _backup_policies.get(fs_id, {"Status": "DISABLED"})})
 
 
+def _put_file_system_policy(fs_id, body):
+    fs = _file_systems.get(fs_id)
+    if not fs:
+        return _error(404, "FileSystemNotFound", f"File system '{fs_id}' does not exist.")
+    policy = body.get("Policy")
+    if not policy:
+        return _error(400, "BadRequest", "Policy is required.")
+    fs["FileSystemPolicy"] = policy
+    return _json(200, {"FileSystemId": fs_id, "Policy": policy})
+
+
+def _describe_file_system_policy(fs_id):
+    fs = _file_systems.get(fs_id)
+    if not fs:
+        return _error(404, "FileSystemNotFound", f"File system '{fs_id}' does not exist.")
+    policy = fs.get("FileSystemPolicy")
+    if not policy:
+        return _error(404, "PolicyNotFound", f"File system '{fs_id}' has no file system policy.")
+    return _json(200, {"FileSystemId": fs_id, "Policy": policy})
+
+
+def _delete_file_system_policy(fs_id):
+    fs = _file_systems.get(fs_id)
+    if not fs:
+        return _error(404, "FileSystemNotFound", f"File system '{fs_id}' does not exist.")
+    fs.pop("FileSystemPolicy", None)
+    return _json(200, {})
+
+
 def _describe_account_preferences():
     return _json(200, {"ResourceIdPreference": {"ResourceIdType": "LONG_ID", "Resources": ["FILE_SYSTEM", "MOUNT_TARGET"]}})
 
@@ -592,6 +625,17 @@ async def handle_request(method, path, headers, body_bytes, query_params):
             return await _a(_put_backup_policy(fs_id, body))
         if method == "GET":
             return await _a(_describe_backup_policy(fs_id))
+
+    # File System Policy
+    m = re.fullmatch(r"/file-systems/([^/]+)/policy", p)
+    if m:
+        fs_id = m.group(1)
+        if method == "PUT":
+            return await _a(_put_file_system_policy(fs_id, body))
+        if method == "GET":
+            return await _a(_describe_file_system_policy(fs_id))
+        if method == "DELETE":
+            return await _a(_delete_file_system_policy(fs_id))
 
     # Account Preferences
     if p == "/account-preferences":

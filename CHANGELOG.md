@@ -10,6 +10,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Added
 
 - **CloudFormation — stack updates replace resources** — a change to a property the change set reports as `RequiresRecreation: Always` now creates a new resource under a new generated name, points its dependents at it and deletes the old one after the update succeeds (a rollback deletes the new one instead). With an explicit, unchanged name the update fails with the AWS message naming the physical id; this now also covers `AWS::Lambda::Function`. A named SQS queue or SNS topic fails with AWS's already-exists error instead and keeps its messages or subscriptions.
+- **CloudFormation — `AWS::EFS::FileSystem`, `AWS::EFS::MountTarget` and `AWS::EFS::AccessPoint`** — a template with an EFS resource failed validation with `Unrecognized resource types`. The three types now create, update and delete through the EFS store, so CDK `efs.FileSystem` stacks deploy. `Ref` and `Fn::GetAtt` follow the CloudFormation reference; `FileSystemPolicy`, `LifecyclePolicies`, `BackupPolicy`, `ThroughputMode`, `ProvisionedThroughputInMibps`, `FileSystemTags`, mount target `SecurityGroups` and `AccessPointTags` update in place, and the create-only properties replace the resource. EFS also gains `PutFileSystemPolicy`, `DescribeFileSystemPolicy` and `DeleteFileSystemPolicy`, stores `AvailabilityZoneName` on `CreateFileSystem`, and removes a file system's lifecycle and backup settings when it is deleted.
 
 ## [1.5.20] — 2026-10-01
 

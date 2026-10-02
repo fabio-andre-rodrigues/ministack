@@ -339,6 +339,67 @@ def test_efs_backup_policy(efs):
     resp = efs.describe_backup_policy(FileSystemId=fs_id)
     assert resp["BackupPolicy"]["Status"] == "ENABLED"
 
+def test_efs_file_system_policy(efs):
+    policy = (
+        '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},'
+        '"Action":"elasticfilesystem:ClientMount"}]}'
+    )
+    fs_id = efs.create_file_system()["FileSystemId"]
+    with pytest.raises(ClientError) as exc:
+        efs.describe_file_system_policy(FileSystemId=fs_id)
+    assert exc.value.response["Error"]["Code"] == "PolicyNotFound"
+
+    put = efs.put_file_system_policy(FileSystemId=fs_id, Policy=policy)
+    assert put["FileSystemId"] == fs_id
+    assert put["Policy"] == policy
+    assert efs.describe_file_system_policy(FileSystemId=fs_id)["Policy"] == policy
+    assert "FileSystemPolicy" not in efs.describe_file_systems(FileSystemId=fs_id)["FileSystems"][0]
+
+    efs.delete_file_system_policy(FileSystemId=fs_id)
+    with pytest.raises(ClientError) as exc:
+        efs.describe_file_system_policy(FileSystemId=fs_id)
+    assert exc.value.response["Error"]["Code"] == "PolicyNotFound"
+
+    missing = "fs-00000000000000000"
+    for call, kwargs in (
+        (efs.put_file_system_policy, {"FileSystemId": missing, "Policy": policy}),
+        (efs.describe_file_system_policy, {"FileSystemId": missing}),
+        (efs.delete_file_system_policy, {"FileSystemId": missing}),
+    ):
+        with pytest.raises(ClientError) as exc:
+            call(**kwargs)
+        assert exc.value.response["Error"]["Code"] == "FileSystemNotFound"
+    efs.delete_file_system(FileSystemId=fs_id)
+
+
+def test_efs_availability_zone_name(efs):
+    fs = efs.create_file_system(AvailabilityZoneName="us-east-1a")
+    assert fs["AvailabilityZoneName"] == "us-east-1a"
+    desc = efs.describe_file_systems(FileSystemId=fs["FileSystemId"])["FileSystems"][0]
+    assert desc["AvailabilityZoneName"] == "us-east-1a"
+    efs.delete_file_system(FileSystemId=fs["FileSystemId"])
+
+
+def test_efs_delete_clears_lifecycle_and_backup_state():
+    import json
+
+    from ministack.services import efs as service
+
+    service.reset()
+    try:
+        fs_id = json.loads(service._create_file_system({})[2])["FileSystemId"]
+        service._put_lifecycle_configuration(fs_id, {"LifecyclePolicies": [{"TransitionToIA": "AFTER_30_DAYS"}]})
+        service._put_backup_policy(fs_id, {"BackupPolicy": {"Status": "ENABLED"}})
+        assert fs_id in service._lifecycle_configs
+        assert fs_id in service._backup_policies
+
+        assert service._delete_file_system(fs_id)[0] == 204
+        assert fs_id not in service._lifecycle_configs
+        assert fs_id not in service._backup_policies
+    finally:
+        service.reset()
+
+
 def _uid():
     return _uuid_mod.uuid4().hex[:8]
 
