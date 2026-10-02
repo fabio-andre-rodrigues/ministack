@@ -1538,7 +1538,7 @@ Compared against LocalStack for AWS as documented on its [pricing](https://www.l
 | Commercial use | ✅ | ❌ (non-commercial only) | ✅ | ✅ |
 | Account and auth token required | ❌ | ✅ (also in CI) | ✅ | ✅ |
 | License | MIT | Proprietary image | Proprietary image | Proprietary image |
-| Services LocalStack advertises | n/a | 30+ | 55+ | 110+ |
+| Services advertised | 90+ | 30+ | 55+ | 110+ |
 | Local state persistence | ✅ (`PERSIST_STATE=1`) | ❌ | ✅ | ✅ |
 | Multi-account and multi-region isolation | ✅ | ✅ | ✅ | ✅ |
 | Docker image size | ~270MB | ~1GB | ~1GB | ~1GB |
