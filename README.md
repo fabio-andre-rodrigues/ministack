@@ -1535,12 +1535,12 @@ Compared against LocalStack for AWS as documented on its [pricing](https://www.l
 | | MiniStack | LocalStack Hobby (free) | LocalStack Base | LocalStack Ultimate |
 |---|---|---|---|---|
 | Price | Free | Free | $39 per license per month billed annually ($45 monthly) | $89 per license per month billed annually |
-| Commercial use | Yes | No, non-commercial only | Yes | Yes |
-| Account and auth token | Not needed | Required, also in CI | Required | Required |
+| Commercial use | ✅ | ❌ (non-commercial only) | ✅ | ✅ |
+| Account and auth token required | ❌ | ✅ (also in CI) | ✅ | ✅ |
 | License | MIT | Proprietary image | Proprietary image | Proprietary image |
 | Services LocalStack advertises | n/a | 30+ | 55+ | 110+ |
-| Local state persistence | Yes (`PERSIST_STATE=1`) | No | Yes | Yes |
-| Multi-account and multi-region isolation | Yes | Yes | Yes | Yes |
+| Local state persistence | ✅ (`PERSIST_STATE=1`) | ❌ | ✅ | ✅ |
+| Multi-account and multi-region isolation | ✅ | ✅ | ✅ | ✅ |
 | Docker image size | ~270MB | ~1GB | ~1GB | ~1GB |
 | Memory at idle | ~30MB | ~500MB | ~500MB | ~500MB |
 | Startup time | <2s | ~15-30s | ~15-30s | ~15-30s |
@@ -1549,46 +1549,46 @@ LocalStack also sells an Enterprise plan with custom pricing, air-gapped deliver
 
 ### Service coverage by LocalStack plan
 
-The "LocalStack plan" column is the lowest plan that includes the service on LocalStack's plans page. This table compares which services exist on each side. It does not compare operation-level depth. LocalStack has had longer to cover individual APIs, and MiniStack has not benchmarked itself against it operation by operation.
+A ✅ under a LocalStack plan means LocalStack's plans page lists the service for that plan. "Not listed" services (last five rows) show ❌ because the page does not mention them. This table compares which services exist on each side. It does not compare operation-level depth. LocalStack has had longer to cover individual APIs, and MiniStack has not benchmarked itself against it operation by operation.
 
-| Service | MiniStack | LocalStack plan |
-|---------|-----------|-----------------|
-| S3, SQS, SNS, DynamoDB, DynamoDB Streams | ✅ | Hobby |
-| Lambda, EC2, Step Functions, EventBridge, EventBridge Scheduler | ✅ | Hobby |
-| IAM, STS, KMS, Secrets Manager, ACM | ✅ | Hobby |
-| CloudFormation, Cloud Control, AWS Config, Resource Groups | ✅ | Hobby |
-| CloudWatch Metrics and Logs, SSM Parameter Store | ✅ | Hobby |
-| Kinesis, Firehose, OpenSearch | ✅ | Hobby |
-| SES v1, Route 53, Transcribe, API Gateway REST (v1) | ✅ | Hobby |
-| SES v2, Amazon MQ | ✅ | Base |
-| API Gateway v2 (HTTP and WebSocket) and Management API | ✅ | Base |
-| ECS, ECR | ✅ | Base |
-| RDS, RDS Data API, ElastiCache | ✅ | Base |
-| ELB and ELBv2, CloudFront | ✅ | Base |
-| Cognito User Pools and Identity Pools | ✅ | Base |
-| IoT Core | ✅ | Base |
-| EC2 Auto Scaling, AppConfig, CodeBuild | ✅ | Base |
-| Athena, Glue, EMR | ✅ | Ultimate |
-| MSK, MWAA, EventBridge Pipes | ✅ | Ultimate |
-| EKS, Batch | ✅ | Ultimate |
-| AppSync, CloudFront KeyValueStore, Cloud Map | ✅ | Ultimate |
-| Bedrock and Bedrock Runtime | ✅ | Ultimate |
-| WAF v2, CloudTrail, Organizations, Account | ✅ | Ultimate |
-| EFS, S3 Files, AWS Backup | ✅ | Ultimate |
-| Transfer Family, IoT Data, IoT Wireless | ✅ | Ultimate |
-| Route 53 Resolver, S3 Control, SWF, Redshift, Support API | ❌ | Hobby |
-| Application Auto Scaling, CodeArtifact, CodeCommit, CodeConnections | ❌ | Base |
-| Amplify, CodeDeploy, CodePipeline, X-Ray, Fault Injection Service | ❌ | Ultimate |
-| DocumentDB, MemoryDB, Neptune, Timestream, DMS | ❌ | Ultimate |
-| SageMaker, Textract, Pinpoint, MediaConvert, Glacier | ❌ | Ultimate |
-| EMR Serverless, Lake Formation, Managed Flink, Redshift Data API | ❌ | Ultimate |
-| IAM Identity Center and Identity Store, RAM, Shield, Private CA, Verified Permissions | ❌ | Ultimate |
-| Cost Explorer, Elastic Beanstalk, Serverless Application Repo, Managed Blockchain | ❌ | Ultimate |
-| Aurora DSQL, S3 Tables | ✅ | not listed |
-| Bedrock Agent, Agent Runtime and AgentCore | ✅ | not listed |
-| Translate, Signer, Inspector2, Cost and Usage Reports | ✅ | not listed |
-| Amazon Location (trackers), MediaConnect, Lambda MicroVMs | ✅ | not listed |
-| WAF Classic, Resource Groups Tagging API | ✅ | not listed |
+| Service | MiniStack | LocalStack Hobby (free) | LocalStack Base | LocalStack Ultimate |
+|---------|-----------|------------------|-----------------|---------------------|
+| S3, SQS, SNS, DynamoDB, DynamoDB Streams | ✅ | ✅ | ✅ | ✅ |
+| Lambda, EC2, Step Functions, EventBridge, EventBridge Scheduler | ✅ | ✅ | ✅ | ✅ |
+| IAM, STS, KMS, Secrets Manager, ACM | ✅ | ✅ | ✅ | ✅ |
+| CloudFormation, Cloud Control, AWS Config, Resource Groups | ✅ | ✅ | ✅ | ✅ |
+| CloudWatch Metrics and Logs, SSM Parameter Store | ✅ | ✅ | ✅ | ✅ |
+| Kinesis, Firehose, OpenSearch | ✅ | ✅ | ✅ | ✅ |
+| SES v1, Route 53, Transcribe, API Gateway REST (v1) | ✅ | ✅ | ✅ | ✅ |
+| SES v2, Amazon MQ | ✅ | ❌ | ✅ | ✅ |
+| API Gateway v2 (HTTP and WebSocket) and Management API | ✅ | ❌ | ✅ | ✅ |
+| ECS, ECR | ✅ | ❌ | ✅ | ✅ |
+| RDS, RDS Data API, ElastiCache | ✅ | ❌ | ✅ | ✅ |
+| ELB and ELBv2, CloudFront | ✅ | ❌ | ✅ | ✅ |
+| Cognito User Pools and Identity Pools | ✅ | ❌ | ✅ | ✅ |
+| IoT Core | ✅ | ❌ | ✅ | ✅ |
+| EC2 Auto Scaling, AppConfig, CodeBuild | ✅ | ❌ | ✅ | ✅ |
+| Athena, Glue, EMR | ✅ | ❌ | ❌ | ✅ |
+| MSK, MWAA, EventBridge Pipes | ✅ | ❌ | ❌ | ✅ |
+| EKS, Batch | ✅ | ❌ | ❌ | ✅ |
+| AppSync, CloudFront KeyValueStore, Cloud Map | ✅ | ❌ | ❌ | ✅ |
+| Bedrock and Bedrock Runtime | ✅ | ❌ | ❌ | ✅ |
+| WAF v2, CloudTrail, Organizations, Account | ✅ | ❌ | ❌ | ✅ |
+| EFS, S3 Files, AWS Backup | ✅ | ❌ | ❌ | ✅ |
+| Transfer Family, IoT Data, IoT Wireless | ✅ | ❌ | ❌ | ✅ |
+| Route 53 Resolver, S3 Control, SWF, Redshift, Support API | ❌ | ✅ | ✅ | ✅ |
+| Application Auto Scaling, CodeArtifact, CodeCommit, CodeConnections | ❌ | ❌ | ✅ | ✅ |
+| Amplify, CodeDeploy, CodePipeline, X-Ray, Fault Injection Service | ❌ | ❌ | ❌ | ✅ |
+| DocumentDB, MemoryDB, Neptune, Timestream, DMS | ❌ | ❌ | ❌ | ✅ |
+| SageMaker, Textract, Pinpoint, MediaConvert, Glacier | ❌ | ❌ | ❌ | ✅ |
+| EMR Serverless, Lake Formation, Managed Flink, Redshift Data API | ❌ | ❌ | ❌ | ✅ |
+| IAM Identity Center and Identity Store, RAM, Shield, Private CA, Verified Permissions | ❌ | ❌ | ❌ | ✅ |
+| Cost Explorer, Elastic Beanstalk, Serverless Application Repo, Managed Blockchain | ❌ | ❌ | ❌ | ✅ |
+| Aurora DSQL, S3 Tables | ✅ | ❌ | ❌ | ❌ |
+| Bedrock Agent, Agent Runtime and AgentCore | ✅ | ❌ | ❌ | ❌ |
+| Translate, Signer, Inspector2, Cost and Usage Reports | ✅ | ❌ | ❌ | ❌ |
+| Amazon Location (trackers), MediaConnect, Lambda MicroVMs | ✅ | ❌ | ❌ | ❌ |
+| WAF Classic, Resource Groups Tagging API | ✅ | ❌ | ❌ | ❌ |
 
 ### What differs in behavior
 
