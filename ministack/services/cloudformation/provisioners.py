@@ -9009,9 +9009,37 @@ def _efs_put_lifecycle_policies(fs_id, policies):
                 "AWS::EFS::FileSystem LifecyclePolicies")
 
 
-def _efs_put_file_system_policy(fs_id, policy):
-    _efs_result(_efs._put_file_system_policy(fs_id, {"Policy": _efs_policy_json(policy)}),
-                "AWS::EFS::FileSystem FileSystemPolicy")
+def _efs_put_file_system_policy(fs_id, props):
+    body = {"Policy": _efs_policy_json(props["FileSystemPolicy"])}
+    if "BypassPolicyLockoutSafetyCheck" in props:
+        body["BypassPolicyLockoutSafetyCheck"] = _cfn_bool(props["BypassPolicyLockoutSafetyCheck"])
+    _efs_result(_efs._put_file_system_policy(fs_id, body), "AWS::EFS::FileSystem FileSystemPolicy")
+
+
+def _efs_put_protection(fs_id, protection):
+    _efs_result(_efs._update_file_system_protection(fs_id, dict(protection or {})),
+                "AWS::EFS::FileSystem FileSystemProtection")
+
+
+def _efs_replication_destinations(configuration):
+    """The Destinations a ReplicationConfiguration property sends to the API:
+    Status and StatusMessage describe the destination, they do not configure it."""
+    return [
+        {k: v for k, v in destination.items() if k not in ("Status", "StatusMessage")}
+        for destination in (configuration or {}).get("Destinations") or []
+    ]
+
+
+def _efs_create_replication(fs_id, configuration):
+    _efs_result(
+        _efs._create_replication_configuration(
+            fs_id, {"Destinations": _efs_replication_destinations(configuration)}),
+        "AWS::EFS::FileSystem ReplicationConfiguration")
+
+
+def _efs_delete_replication(fs_id):
+    _efs_result(_efs._delete_replication_configuration(fs_id, {}),
+                "AWS::EFS::FileSystem ReplicationConfiguration delete", missing_ok=True)
 
 
 def _efs_file_system_create(logical_id, props, stack_name):
@@ -9034,7 +9062,11 @@ def _efs_file_system_create(logical_id, props, stack_name):
     if props.get("BackupPolicy"):
         _efs_put_backup_policy(fs_id, props["BackupPolicy"])
     if props.get("FileSystemPolicy"):
-        _efs_put_file_system_policy(fs_id, props["FileSystemPolicy"])
+        _efs_put_file_system_policy(fs_id, props)
+    if props.get("FileSystemProtection"):
+        _efs_put_protection(fs_id, props["FileSystemProtection"])
+    if props.get("ReplicationConfiguration"):
+        _efs_create_replication(fs_id, props["ReplicationConfiguration"])
     return fs_id, _efs_file_system_attrs(fs)
 
 
@@ -9060,23 +9092,37 @@ def _efs_file_system_update(physical_id, old_props, new_props, stack_name, logic
         _efs_put_backup_policy(physical_id, new_props.get("BackupPolicy") or {"Status": "DISABLED"})
     if new_props.get("FileSystemPolicy") != old_props.get("FileSystemPolicy"):
         if new_props.get("FileSystemPolicy"):
-            _efs_put_file_system_policy(physical_id, new_props["FileSystemPolicy"])
+            _efs_put_file_system_policy(physical_id, new_props)
         else:
             _efs_result(_efs._delete_file_system_policy(physical_id),
                         "AWS::EFS::FileSystem FileSystemPolicy")
+    if new_props.get("FileSystemProtection") != old_props.get("FileSystemProtection"):
+        _efs_put_protection(physical_id, new_props.get("FileSystemProtection")
+                            or {"ReplicationOverwriteProtection": "ENABLED"})
+    if new_props.get("ReplicationConfiguration") != old_props.get("ReplicationConfiguration"):
+        _efs_delete_replication(physical_id)
+        if new_props.get("ReplicationConfiguration"):
+            _efs_create_replication(physical_id, new_props["ReplicationConfiguration"])
     _reconcile_tag_list(fs.setdefault("Tags", []), old_props, new_props, prop="FileSystemTags")
     _efs_refresh_name(fs)
     return physical_id, _efs_file_system_attrs(fs)
 
 
 def _efs_file_system_delete(physical_id, props):
+    # A file system in a replication configuration cannot be deleted; the
+    # destination it created stays, as on AWS.
+    _efs_delete_replication(physical_id)
     _efs_result(_efs._delete_file_system(physical_id),
                 "AWS::EFS::FileSystem delete", missing_ok=True)
 
 
 def _efs_mount_target_attrs(mount_target):
     # Id is the file system id, as the CloudFormation reference documents.
-    return {"IpAddress": mount_target["IpAddress"], "Id": mount_target["FileSystemId"]}
+    # An IPV6_ONLY mount target has no IPv4 address.
+    attrs = {"Id": mount_target["FileSystemId"]}
+    if "IpAddress" in mount_target:
+        attrs["IpAddress"] = mount_target["IpAddress"]
+    return attrs
 
 
 def _efs_mount_target_create(logical_id, props, stack_name):
@@ -9085,8 +9131,9 @@ def _efs_mount_target_create(logical_id, props, stack_name):
         "SubnetId": props.get("SubnetId", ""),
         "SecurityGroups": list(props.get("SecurityGroups") or []),
     }
-    if props.get("IpAddress"):
-        body["IpAddress"] = props["IpAddress"]
+    for key in ("IpAddress", "Ipv6Address", "IpAddressType"):
+        if props.get(key):
+            body[key] = props[key]
     mount_target = _efs_result(_efs._create_mount_target(body), "AWS::EFS::MountTarget create")
     return mount_target["MountTargetId"], _efs_mount_target_attrs(mount_target)
 

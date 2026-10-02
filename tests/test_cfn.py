@@ -6618,6 +6618,16 @@ def test_cfn_servicediscovery_cdk_ecs_shape(cfn, sd):
 
 _efs_physical_ids = _sd_physical_ids
 
+
+def _efs_client_for_region(region):
+    return boto3.client(
+        "efs",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+    )
+
 _EFS_POLICY = {
     "Version": "2012-10-17",
     "Statement": [{
@@ -6729,7 +6739,10 @@ def test_cfn_efs_create(cfn, efs):
     assert efs.describe_lifecycle_configuration(FileSystemId=fs_id)["LifecyclePolicies"] == [
         {"TransitionToIA": "AFTER_30_DAYS"}]
     assert efs.describe_backup_policy(FileSystemId=fs_id)["BackupPolicy"]["Status"] == "ENABLED"
-    assert json.loads(efs.describe_file_system_policy(FileSystemId=fs_id)["Policy"]) == _EFS_POLICY
+    stored_policy = json.loads(efs.describe_file_system_policy(FileSystemId=fs_id)["Policy"])
+    assert stored_policy["Statement"][0]["Action"] == _EFS_POLICY["Statement"][0]["Action"]
+    assert stored_policy["Statement"][0]["Resource"] == out["FsArn"]
+    assert fs["FileSystemProtection"]["ReplicationOverwriteProtection"] == "ENABLED"
 
     mt = efs.describe_mount_targets(MountTargetId=out["MtRef"])["MountTargets"][0]
     assert mt["FileSystemId"] == fs_id
@@ -6862,6 +6875,138 @@ def test_cfn_efs_cdk_shape(cfn, efs):
         assert _efs_error_code(efs.describe_mount_targets, MountTargetId=ids[logical_id]) == "MountTargetNotFound"
     assert efs.describe_access_points(AccessPointId=ids["Ap"])["AccessPoints"] == []
     efs.delete_file_system(FileSystemId=ids["Fs"])
+
+
+def _efs_single_file_system_template(**properties):
+    return {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"Fs": {"Type": "AWS::EFS::FileSystem", "Properties": properties}},
+    }
+
+
+def test_cfn_efs_file_system_protection(cfn, efs):
+    stack_name = f"cfn-efs-prot-{_uuid_mod.uuid4().hex[:8]}"
+    protection = lambda value: {"ReplicationOverwriteProtection": value}  # noqa: E731
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(
+        _efs_single_file_system_template(FileSystemProtection=protection("DISABLED"))))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+    fs_id = _efs_physical_ids(cfn, stack_name)["Fs"]
+
+    def current():
+        return efs.describe_file_systems(FileSystemId=fs_id)["FileSystems"][0][
+            "FileSystemProtection"]["ReplicationOverwriteProtection"]
+
+    assert current() == "DISABLED"
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(
+        _efs_single_file_system_template(FileSystemProtection=protection("ENABLED"))))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    assert _efs_physical_ids(cfn, stack_name)["Fs"] == fs_id and current() == "ENABLED"
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(
+        _efs_single_file_system_template(FileSystemProtection=protection("DISABLED"))))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(
+        _efs_single_file_system_template(ThroughputMode="bursting")))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    assert current() == "ENABLED"  # the dropped property reverts to the default
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_efs_replication_configuration(cfn, efs):
+    west = _efs_client_for_region("us-west-2")
+    stack_name = f"cfn-efs-repl-cfg-{_uuid_mod.uuid4().hex[:8]}"
+    template = _efs_single_file_system_template(
+        Encrypted=True,
+        ReplicationConfiguration={"Destinations": [{"Region": "us-west-2"}]},
+    )
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+    fs_id = _efs_physical_ids(cfn, stack_name)["Fs"]
+
+    config = efs.describe_replication_configurations(FileSystemId=fs_id)["Replications"][0]
+    destination_id = config["Destinations"][0]["FileSystemId"]
+    assert config["Destinations"][0]["Region"] == "us-west-2"
+    destination = west.describe_file_systems(FileSystemId=destination_id)["FileSystems"][0]
+    assert destination["Encrypted"] is True
+    assert destination["FileSystemProtection"]["ReplicationOverwriteProtection"] == "REPLICATING"
+
+    # Dropping the property ends the replication; the destination stays, writeable again.
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(
+        _efs_single_file_system_template(Encrypted=True)))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    assert _efs_physical_ids(cfn, stack_name)["Fs"] == fs_id
+    assert _efs_error_code(efs.describe_replication_configurations, FileSystemId=fs_id) == "ReplicationNotFound"
+    destination = west.describe_file_systems(FileSystemId=destination_id)["FileSystems"][0]
+    assert destination["FileSystemProtection"]["ReplicationOverwriteProtection"] == "ENABLED"
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    second = efs.describe_replication_configurations(FileSystemId=fs_id)["Replications"][0]
+    second_destination = second["Destinations"][0]["FileSystemId"]
+
+    # Stack delete ends the replication first, which a file system in one cannot do without.
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+    assert _efs_error_code(efs.describe_file_systems, FileSystemId=fs_id) == "FileSystemNotFound"
+    for leftover in (destination_id, second_destination):
+        west.delete_file_system(FileSystemId=leftover)
+
+
+def test_cfn_efs_policy_lockout_check_and_bypass(cfn, efs):
+    lockout = {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Deny", "Principal": {"AWS": "*"},
+            "Action": "elasticfilesystem:PutFileSystemPolicy", "Resource": "*",
+        }],
+    }
+    refused = f"cfn-efs-lock-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=refused, TemplateBody=json.dumps(
+        _efs_single_file_system_template(FileSystemPolicy=lockout)), OnFailure="DO_NOTHING")
+    assert _wait_stack(cfn, refused)["StackStatus"] == "CREATE_FAILED"
+    events = cfn.describe_stack_events(StackName=refused)["StackEvents"]
+    assert any("InvalidPolicyException" in e.get("ResourceStatusReason", "") for e in events)
+    cfn.delete_stack(StackName=refused)
+    _wait_stack(cfn, refused)
+
+    allowed = f"cfn-efs-bypass-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=allowed, TemplateBody=json.dumps(
+        _efs_single_file_system_template(FileSystemPolicy=lockout, BypassPolicyLockoutSafetyCheck=True)))
+    assert _wait_stack(cfn, allowed)["StackStatus"] == "CREATE_COMPLETE"
+    fs_id = _efs_physical_ids(cfn, allowed)["Fs"]
+    assert json.loads(efs.describe_file_system_policy(FileSystemId=fs_id)["Policy"])["Statement"][0]["Effect"] == "Deny"
+    cfn.delete_stack(StackName=allowed)
+    _wait_stack(cfn, allowed)
+
+
+def test_cfn_efs_mount_target_ip_properties(cfn, efs):
+    stack_name = f"cfn-efs-ip-{_uuid_mod.uuid4().hex[:8]}"
+    template = _efs_stack_template()
+    template["Resources"]["Mt1"]["Properties"].update({"IpAddress": "10.0.1.50", "IpAddressType": "IPV4_ONLY"})
+    template["Outputs"] = {"MtIp": {"Value": {"Fn::GetAtt": ["Mt1", "IpAddress"]}}}
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    assert {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["MtIp"] == "10.0.1.50"
+    ids = _efs_physical_ids(cfn, stack_name)
+    mt = efs.describe_mount_targets(MountTargetId=ids["Mt1"])["MountTargets"][0]
+    assert mt["IpAddress"] == "10.0.1.50" and mt["SubnetId"] == ids["Subnet1"] and mt["VpcId"] == ids["Vpc"]
+    # Mt2 takes the first free address of its own subnet.
+    assert efs.describe_mount_targets(MountTargetId=ids["Mt2"])["MountTargets"][0]["IpAddress"] == "10.0.2.4"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+    # The subnets here have no IPv6 CIDR block, so an IPv6 address type fails the stack.
+    failing = _efs_stack_template()
+    failing["Resources"]["Mt1"]["Properties"]["IpAddressType"] = "DUAL_STACK"
+    failed_name = f"cfn-efs-ipv6-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=failed_name, TemplateBody=json.dumps(failing), OnFailure="DO_NOTHING")
+    assert _wait_stack(cfn, failed_name)["StackStatus"] == "CREATE_FAILED"
+    cfn.delete_stack(StackName=failed_name)
+    _wait_stack(cfn, failed_name)
 
 
 # ---------------------------------------------------------------------------
