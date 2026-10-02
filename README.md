@@ -4,7 +4,7 @@
 
 <h1 align="center">MiniStack</h1>
 <p align="center"><strong>Free, open-source local AWS emulator. Free forever.</strong></p>
-<p align="center">60+ AWS services on a single port · Multi-account & multi-region · Terraform compatible · Real databases · MIT licensed</p>
+<p align="center">90+ AWS services on a single port · Multi-account & multi-region · Terraform compatible · Real databases · MIT licensed</p>
 
 <p align="center">
   <a href="https://github.com/ministackorg/ministack/releases"><img src="https://img.shields.io/github/v/release/ministackorg/ministack" alt="GitHub release"></a>
@@ -12,7 +12,7 @@
   <a href="https://hub.docker.com/r/ministackorg/ministack"><img src="https://img.shields.io/docker/pulls/ministackorg/ministack" alt="Docker Pulls"></a>
   <a href="https://hub.docker.com/r/ministackorg/ministack"><img src="https://img.shields.io/docker/image-size/ministackorg/ministack/latest" alt="Docker Image Size"></a>
   <a href="https://github.com/ministackorg/ministack/blob/main/LICENSE"><img src="https://img.shields.io/github/license/ministackorg/ministack" alt="License"></a>
-  <img src="https://img.shields.io/badge/python-3.12-blue" alt="Python">
+  <img src="https://img.shields.io/badge/python-3.10%20to%203.13-blue" alt="Python">
 </p>
 
 <p align="center">
@@ -23,9 +23,9 @@
 
 ## Why MiniStack?
 
-LocalStack recently moved its core services behind a paid plan. If you relied on LocalStack Community for local development and CI/CD pipelines, MiniStack is your free alternative.
+Since 23 March 2026, LocalStack for AWS ships as one image that needs a LocalStack account and auth token, including in CI. The free Hobby plan is limited to non-commercial use. Commercial use needs Base ($39 per license per month billed annually) or Ultimate ($89). MiniStack needs no account, no token and no license fee, and its MIT license permits commercial use. See [Comparison](#comparison) for a per-service breakdown against each LocalStack plan.
 
-- **60+ AWS services** emulated on a single port (4566)
+- **90+ AWS services** emulated on a single port (4566)
 - **Drop-in compatible** — works with `boto3`, AWS CLI, Terraform, CDK, Pulumi, any SDK
 - **Multi-account & multi-region** — a 12-digit access key becomes the account, the SigV4 region scopes the state; isolated tenants and regions on one endpoint, like real AWS
 - **Amazon Bedrock locally** — Converse / InvokeModel with AWS-exact wire shapes; point `MINISTACK_BEDROCK_PROXY_URL` at Ollama, llama.cpp, or vLLM and get real completions through the Bedrock API
@@ -452,6 +452,11 @@ subnet = ec2.create_subnet(
 | **Inspector2** | Enable, Disable, ListFindings, BatchGetFindingDetails, ListCoverage, ListCoverageStatistics, ListFindingAggregations, SearchVulnerabilities, TagResource, UntagResource, ListTagsForResource, CreateFilter, ListFilters, DeleteFilter | 14 operations; deterministic stub vulnerability findings for ECR images, Lambda functions, and EC2 instances; filtering, sorting, pagination |
 | **AmazonMQ** | CreateBroker, ListBrokers, DescribeBrokers, DeleteBrokers, UpdateBroker, RebootBroker, DescribeBrokerEngineTypes, DescribeBrokerInstanceOptions, CreateTags, ListTags, DeleteTags, CreateUser, DeleteUser, ListUsers, UpdateUser, DescribeUser | 16 of 24 spec ops; No real container support |
 | **Amazon Location (trackers)** | CreateTracker, DescribeTracker, UpdateTracker, ListTrackers, DeleteTracker, BatchUpdateDevicePosition, GetDevicePosition, BatchGetDevicePosition, GetDevicePositionHistory | Tracker control plane + in-memory device-position store; signs with credential scope `geo` (the client is named `location`); ISO 8601 `SampleTime`/`ReceivedTime`, `Position` as the modeled `[lon, lat]` double pair, out-of-range coordinates as per-entry `Errors`; `GetDevicePositionHistory` ascending, defaulting to the last 24 h; `ListTrackers` and the history page at `MaxResults` 1..100 with `NextToken`; every sample is stored (no position filtering, no 30-day expiry), newest 100 per device; `KmsKeyId`/`PositionFiltering`/`EventBridgeEnabled`/`Tags` stored without effect; no consumers, geofences, maps, places or routes; CFN `AWS::Location::Tracker` supported |
+| **EventBridge Pipes** | CreatePipe, DescribePipe, UpdatePipe, DeletePipe, ListPipes, StartPipe, StopPipe, TagResource, UntagResource, ListTagsForResource | The background poller runs DynamoDB Streams sources into SNS and Step Functions targets; other source and target types are stored but not run |
+| **MWAA (Airflow)** | CreateEnvironment, GetEnvironment, UpdateEnvironment, DeleteEnvironment, ListEnvironments, CreateWebLoginToken, CreateCliToken | With Docker, `CreateEnvironment` starts a real Apache Airflow 3.x container and `WebserverUrl` points at it; DAGs sync from the S3 path in `DagS3Path` |
+| **MediaConnect** | CreateFlow, DescribeFlow, ListFlows, UpdateFlow, DescribeFlowSourceMetadata, DescribeFlowSourceThumbnail, ListTagsForResource | Control-plane stub: flows and tags are stored, nothing streams |
+| **Lambda MicroVMs** | CreateMicrovmImage, GetMicrovmImage, GetMicrovmImageVersion, UpdateMicrovmImage, ListMicrovmImages, RunMicrovm, GetMicrovm, ListMicrovms, SuspendMicrovm, ResumeMicrovm, TerminateMicrovm, CreateMicrovmAuthToken, CreateMicrovmShellAuthToken | Control plane for API version 2025-09-09; no VM runs, so a MicroVM goes straight to `RUNNING` and an image build to `CREATED`. With Docker, images build from the `codeArtifact` Dockerfile |
+| **Resource Groups Tagging API** | GetResources, GetTagKeys, GetTagValues, TagResources, UntagResources | Reads and writes tags across the services that register a collector |
 
 
 
@@ -612,11 +617,11 @@ MiniStack expands AWS SAM transforms (`Transform: AWS::Serverless-2016-10-31`) i
 | **Firehose** | CreateDeliveryStream, DeleteDeliveryStream, DescribeDeliveryStream, ListDeliveryStreams, PutRecord, PutRecordBatch, UpdateDestination, TagDeliveryStream, UntagDeliveryStream, ListTagsForDeliveryStream, StartDeliveryStreamEncryption, StopDeliveryStreamEncryption | S3 destinations write records to the local S3 emulator; all other destination types buffer in-memory; concurrency-safe `UpdateDestination` via `VersionId`; `DeliveryStreamType=KinesisStreamAsSource` consumes records from the source Kinesis stream on `PutRecord` / `PutRecords` and forwards them to the configured S3 destination, honoring `Prefix` and `DeliveryStartTimestamp`; `ProcessingConfiguration.Processors[].Type=Lambda` invoked per-batch with the AWS-shape event (`{invocationId, deliveryStreamArn, region, records:[{recordId, approximateArrivalTimestamp, data}]}`) — `Ok` records ship the transformed data downstream, `Dropped`/`ProcessingFailed` are omitted, Lambda failures pass records through unchanged (best-effort per AWS) |
 | **Route53** | CreateHostedZone, GetHostedZone, DeleteHostedZone, ListHostedZones, ListHostedZonesByName, UpdateHostedZoneComment, ChangeResourceRecordSets (CREATE/UPSERT/DELETE), ListResourceRecordSets, GetChange, CreateHealthCheck, GetHealthCheck, DeleteHealthCheck, ListHealthChecks, UpdateHealthCheck, ChangeTagsForResource, ListTagsForResource | REST/XML protocol; SOA + NS records auto-created; CallerReference idempotency; alias records, weighted/failover/latency routing; marker-based pagination |
 | **EC2** | RunInstances, DescribeInstances, DescribeInstanceAttribute, DescribeInstanceTypes, DescribeVpcAttribute, TerminateInstances, StopInstances, StartInstances, RebootInstances, AssociateIamInstanceProfile, DescribeIamInstanceProfileAssociations, DisassociateIamInstanceProfile, ReplaceIamInstanceProfileAssociation, DescribeImages, RegisterImage, DeregisterImage, ModifyImageAttribute, DescribeImageAttribute, ResetImageAttribute, CreateSecurityGroup, DeleteSecurityGroup, DescribeSecurityGroups, AuthorizeSecurityGroupIngress, RevokeSecurityGroupIngress, AuthorizeSecurityGroupEgress, RevokeSecurityGroupEgress, DescribeSecurityGroupRules, CreateKeyPair, DeleteKeyPair, DescribeKeyPairs, ImportKeyPair, CreatePlacementGroup, DeletePlacementGroup, DescribePlacementGroups, CreateVpc, DeleteVpc, DescribeVpcs, ModifyVpcAttribute, CreateSubnet, DeleteSubnet, DescribeSubnets, ModifySubnetAttribute, CreateInternetGateway, DeleteInternetGateway, DescribeInternetGateways, AttachInternetGateway, DetachInternetGateway, CreateRouteTable, DeleteRouteTable, DescribeRouteTables, AssociateRouteTable, DisassociateRouteTable, ReplaceRouteTableAssociation, CreateRoute, ReplaceRoute, DeleteRoute, CreateNetworkInterface, DeleteNetworkInterface, DescribeNetworkInterfaces, AttachNetworkInterface, DetachNetworkInterface, CreateVpcEndpoint, DeleteVpcEndpoints, DescribeVpcEndpoints, ModifyVpcEndpoint, DescribePrefixLists, DescribeAvailabilityZones, AllocateAddress, ReleaseAddress, AssociateAddress, DisassociateAddress, DescribeAddresses, DescribeAddressesAttribute, CreateTags, DeleteTags, DescribeTags, CreateNatGateway, DescribeNatGateways, DeleteNatGateway, CreateNetworkAcl, DescribeNetworkAcls, DeleteNetworkAcl, CreateNetworkAclEntry, DeleteNetworkAclEntry, ReplaceNetworkAclEntry, ReplaceNetworkAclAssociation, CreateFlowLogs, DescribeFlowLogs, DeleteFlowLogs, CreateVpcPeeringConnection, AcceptVpcPeeringConnection, DescribeVpcPeeringConnections, DeleteVpcPeeringConnection, CreateDhcpOptions, AssociateDhcpOptions, DescribeDhcpOptions, DeleteDhcpOptions, CreateEgressOnlyInternetGateway, DescribeEgressOnlyInternetGateways, DeleteEgressOnlyInternetGateway, CreateManagedPrefixList, DescribeManagedPrefixLists, GetManagedPrefixListEntries, ModifyManagedPrefixList, DeleteManagedPrefixList, CreateVpnGateway, DescribeVpnGateways, AttachVpnGateway, DetachVpnGateway, DeleteVpnGateway, EnableVgwRoutePropagation, DisableVgwRoutePropagation, CreateCustomerGateway, DescribeCustomerGateways, DeleteCustomerGateway, DescribeInstanceCreditSpecifications, DescribeInstanceMaintenanceOptions, DescribeInstanceAutoRecoveryAttribute, ModifyInstanceMaintenanceOptions, DescribeInstanceTopology, DescribeSpotInstanceRequests, DescribeCapacityReservations, DescribeInstanceStatus, DescribeVpcClassicLink, DescribeVpcClassicLinkDnsSupport, CreateLaunchTemplate, CreateLaunchTemplateVersion, DescribeLaunchTemplates, DescribeLaunchTemplateVersions, ModifyLaunchTemplate, DeleteLaunchTemplate, CreateFleet, DescribeFleets | 133 actions; EC2 Fleet (`CreateFleet` / `DescribeFleets`) with `instant`-type synchronous launch and `maintain` / `request` async fulfillment, multi-config × multi-override round-robin capacity distribution, and `DefaultTargetCapacityType`-driven spot/on-demand selection — unblocks Karpenter / Cluster Autoscaler local validation; IAM instance profile association lifecycle is persisted (`Associate*`, `Describe*`, `Replace*`, `Disassociate*`) so Terraform `aws_instance.iam_instance_profile` round-trips without drift; `AuthorizeSecurityGroupIngress` is idempotent on duplicate rules (same behavior as egress; avoids Terraform re-apply failures); metadata-only instance records by default — `RegisterImage` with a container reference makes an AMI whose launches get a real box, so SSM Run Command returns a real exit code (see *Instances with a real box*); CreateVpc provisions per-VPC default route table, network ACL, and security group; cross-account AMI sharing via launch permissions (`ModifyImageAttribute` add/remove, `Group=all` makes the image public, `DescribeImages` shows shared images with the owner's `OwnerId`, `ExecutableUsers` honored, shared AMIs launch); full Terraform VPC module v6.6.0 compatible; VPN/Customer gateways, managed prefix lists, VPC endpoints with modify support; launch templates with versioning ($Latest/$Default) |
-| **EBS** | CreateVolume, DeleteVolume, DescribeVolumes, DescribeVolumeStatus, AttachVolume, DetachVolume, ModifyVolume, DescribeVolumesModifications, EnableVolumeIO, ModifyVolumeAttribute, DescribeVolumeAttribute, CreateSnapshot, DeleteSnapshot, DescribeSnapshots, CopySnapshot, ModifySnapshotAttribute, DescribeSnapshotAttribute | Part of EC2 Query/XML service; attach/detach updates volume state; snapshots stored as completed immediately; Pro-only on LocalStack — free here |
-| **EFS** | CreateFileSystem, DescribeFileSystems, DeleteFileSystem, UpdateFileSystem, CreateMountTarget, DescribeMountTargets, DeleteMountTarget, DescribeMountTargetSecurityGroups, ModifyMountTargetSecurityGroups, CreateAccessPoint, DescribeAccessPoints, DeleteAccessPoint, TagResource, UntagResource, ListTagsForResource, PutLifecycleConfiguration, DescribeLifecycleConfiguration, PutBackupPolicy, DescribeBackupPolicy, DescribeAccountPreferences, PutAccountPreferences | REST/JSON `/2015-02-01/*`; CreationToken idempotency; FileSystem deletion blocked when mount targets exist; Pro-only on LocalStack — free here |
-| **EMR** | RunJobFlow, DescribeCluster, ListClusters, TerminateJobFlows, ModifyCluster, SetTerminationProtection, SetVisibleToAllUsers, AddJobFlowSteps, DescribeStep, ListSteps, CancelSteps, AddInstanceFleet, ListInstanceFleets, ModifyInstanceFleet, AddInstanceGroups, ListInstanceGroups, ModifyInstanceGroups, ListBootstrapActions, AddTags, RemoveTags, GetBlockPublicAccessConfiguration, PutBlockPublicAccessConfiguration | Control plane only — no real Spark/Hadoop; clusters start in WAITING (KeepAlive=true) or TERMINATED (KeepAlive=false); steps stored as COMPLETED immediately; all three instance modes (simple, InstanceGroups, InstanceFleets); TerminationProtected enforced; Pro-only on LocalStack — free here |
+| **EBS** | CreateVolume, DeleteVolume, DescribeVolumes, DescribeVolumeStatus, AttachVolume, DetachVolume, ModifyVolume, DescribeVolumesModifications, EnableVolumeIO, ModifyVolumeAttribute, DescribeVolumeAttribute, CreateSnapshot, DeleteSnapshot, DescribeSnapshots, CopySnapshot, ModifySnapshotAttribute, DescribeSnapshotAttribute | Part of EC2 Query/XML service; attach/detach updates volume state; snapshots stored as completed immediately |
+| **EFS** | CreateFileSystem, DescribeFileSystems, DeleteFileSystem, UpdateFileSystem, CreateMountTarget, DescribeMountTargets, DeleteMountTarget, DescribeMountTargetSecurityGroups, ModifyMountTargetSecurityGroups, CreateAccessPoint, DescribeAccessPoints, DeleteAccessPoint, TagResource, UntagResource, ListTagsForResource, PutLifecycleConfiguration, DescribeLifecycleConfiguration, PutBackupPolicy, DescribeBackupPolicy, DescribeAccountPreferences, PutAccountPreferences | REST/JSON `/2015-02-01/*`; CreationToken idempotency; FileSystem deletion blocked when mount targets exist |
+| **EMR** | RunJobFlow, DescribeCluster, ListClusters, TerminateJobFlows, ModifyCluster, SetTerminationProtection, SetVisibleToAllUsers, AddJobFlowSteps, DescribeStep, ListSteps, CancelSteps, AddInstanceFleet, ListInstanceFleets, ModifyInstanceFleet, AddInstanceGroups, ListInstanceGroups, ModifyInstanceGroups, ListBootstrapActions, AddTags, RemoveTags, GetBlockPublicAccessConfiguration, PutBlockPublicAccessConfiguration | Control plane only — no real Spark/Hadoop; clusters start in WAITING (KeepAlive=true) or TERMINATED (KeepAlive=false); steps stored as COMPLETED immediately; all three instance modes (simple, InstanceGroups, InstanceFleets); TerminationProtected enforced |
 | **Cognito** | **User Pools**: CreateUserPool, DeleteUserPool, DescribeUserPool, ListUserPools, UpdateUserPool, CreateUserPoolClient, DeleteUserPoolClient, DescribeUserPoolClient, ListUserPoolClients, UpdateUserPoolClient, CreateResourceServer, UpdateResourceServer, DescribeResourceServer, DeleteResourceServer, ListResourceServers, AdminCreateUser, AdminDeleteUser, AdminGetUser, ListUsers, AdminSetUserPassword, AdminUpdateUserAttributes, AdminConfirmSignUp, AdminDisableUser, AdminEnableUser, AdminResetUserPassword, AdminUserGlobalSignOut, AdminAddUserToGroup, AdminRemoveUserFromGroup, AdminListGroupsForUser, AdminListUserAuthEvents, AdminInitiateAuth, AdminRespondToAuthChallenge, InitiateAuth, RespondToAuthChallenge, GlobalSignOut, RevokeToken, SignUp, ConfirmSignUp, ForgotPassword, ConfirmForgotPassword, ChangePassword, GetUser, UpdateUserAttributes, DeleteUser, CreateGroup, DeleteGroup, GetGroup, ListGroups, ListUsersInGroup, CreateUserPoolDomain, DeleteUserPoolDomain, DescribeUserPoolDomain, GetUserPoolMfaConfig, SetUserPoolMfaConfig, AssociateSoftwareToken, VerifySoftwareToken, AdminSetUserMFAPreference, SetUserMFAPreference, CreateIdentityProvider, DescribeIdentityProvider, UpdateIdentityProvider, DeleteIdentityProvider, ListIdentityProviders, GetIdentityProviderByIdentifier, AdminLinkProviderForUser, AdminDisableProviderForUser, TagResource, UntagResource, ListTagsForResource; **Identity Pools**: CreateIdentityPool, DeleteIdentityPool, DescribeIdentityPool, ListIdentityPools, UpdateIdentityPool, GetId, GetCredentialsForIdentity, GetOpenIdToken, SetIdentityPoolRoles, GetIdentityPoolRoles, SetPrincipalTagAttributeMap, GetPrincipalTagAttributeMap, ListIdentities, DescribeIdentity, MergeDeveloperIdentities, UnlinkDeveloperIdentity, UnlinkIdentity, TagResource, UntagResource, ListTagsForResource; **OAuth2**: /oauth2/token (client_credentials) | Stub JWT tokens (structurally valid base64url JWTs); `USER_SRP_AUTH` runs real SRP: `PASSWORD_VERIFIER` checks the client's proof against the stored password; **CUSTOM_AUTH flow** wired through the configured `DefineAuthChallenge` / `CreateAuthChallenge` / `VerifyAuthChallengeResponse` Lambda triggers (passwordless / magic-link / SMS-OTP); session TTL honors `AuthSessionValidity`, capped at 3 answered rounds per AWS; confirmation codes hardcoded (signup: 123456, forgot-password: 654321); TOTP verifies for real: the `AssociateSoftwareToken` secret is stored and checked with RFC 6238 (wrong code = `EnableSoftwareTokenMFAException` on verify, `CodeMismatchException` on the SOFTWARE_TOKEN_MFA challenge); MFA config and per-user enrollment stored in-memory; **user pool domains**: `CreateUserPoolDomain` with `CustomDomainConfig` registers a custom domain served on its own FQDN (without it, `Domain` is a prefix expanded to `{prefix}.auth.{region}.amazoncognito.com`), and the SAML ACS URL and OIDC federation callback are built from it — set one when MiniStack is reached through an external TLS terminator, so external IdPs get a reachable `https://{domain}/oauth2/idpresponse` instead of the internal gateway address; **federated user linking**: `AdminLinkProviderForUser` links an external identity to an existing profile before its first sign-in, so that sign-in resolves to the linked profile instead of minting a second `{Provider}_id` one, and the profile carries the `identities` attribute (also an ID-token claim); **`PreventUserExistenceErrors=ENABLED`** hides an unknown user across the auth flows (generic `NotAuthorizedException` incl. at `RespondToAuthChallenge`, simulated `CodeDeliveryDetails` with the masked `Destination` on `ForgotPassword`/`ResendConfirmationCode`, `CodeMismatchException` on `ConfirmForgotPassword`; the API default is `LEGACY`, as on AWS); `AdminListUserAuthEvents` requires `UserPoolAddOns.AdvancedSecurityMode` != `OFF`, else `UserPoolAddOnNotEnabledException` as on AWS — events themselves are never recorded, so the answer is always an empty list; **principal tag attribute maps** are stored and reported verbatim per identity provider, and a provider that was never configured answers `ResourceNotFoundException` (`No Principal Tags configured for Provider {name}`) as on AWS — `UseDefaults` round-trips but is never expanded into a tag map, since AWS applies the default claim mapping when it vends credentials, and `GetCredentialsForIdentity` registers its credentials as an STS session (GetCallerIdentity reports the pool role assumed as `CognitoIdentityCredentials`, and `AUTH=true` evaluates the session like any AssumeRole), though principal tags still never reach a session's `aws:PrincipalTag` policy context |
-| **ECR** | CreateRepository, DescribeRepositories, DeleteRepository, ListImages, DescribeImages, PutImage, BatchGetImage, BatchDeleteImage, GetAuthorizationToken, GetRepositoryPolicy, SetRepositoryPolicy, DeleteRepositoryPolicy, PutLifecyclePolicy, GetLifecyclePolicy, DeleteLifecyclePolicy, ListTagsForResource, TagResource, UntagResource, PutImageTagMutability, PutImageScanningConfiguration, DescribeRegistry, GetDownloadUrlForLayer, BatchCheckLayerAvailability, InitiateLayerUpload, UploadLayerPart, CompleteLayerUpload | In-memory image registry; Docker V2 manifest support; authorization token generation; lifecycle policies; tag mutability; Pro-only on LocalStack — free here |
+| **ECR** | CreateRepository, DescribeRepositories, DeleteRepository, ListImages, DescribeImages, PutImage, BatchGetImage, BatchDeleteImage, GetAuthorizationToken, GetRepositoryPolicy, SetRepositoryPolicy, DeleteRepositoryPolicy, PutLifecyclePolicy, GetLifecyclePolicy, DeleteLifecyclePolicy, ListTagsForResource, TagResource, UntagResource, PutImageTagMutability, PutImageScanningConfiguration, DescribeRegistry, GetDownloadUrlForLayer, BatchCheckLayerAvailability, InitiateLayerUpload, UploadLayerPart, CompleteLayerUpload | In-memory image registry; Docker V2 manifest support; authorization token generation; lifecycle policies; tag mutability |
 | **AppSync** | **GraphQL APIs**: CreateGraphQLApi, GetGraphQLApi, ListGraphQLApis, UpdateGraphQLApi, DeleteGraphQLApi, CreateApiKey, UpdateApiKey, DeleteApiKey, ListApiKeys, CreateDataSource, GetDataSource, ListDataSources, UpdateDataSource, DeleteDataSource, CreateResolver, GetResolver, ListResolvers, UpdateResolver, DeleteResolver, CreateFunction, GetFunction, ListFunctions, UpdateFunction, DeleteFunction, CreateType, GetType, ListTypes, UpdateType, StartSchemaCreation, GetSchemaCreationStatus, GetIntrospectionSchema, PutGraphqlApiEnvironmentVariables, GetGraphqlApiEnvironmentVariables, CreateApiCache, GetApiCache, UpdateApiCache, DeleteApiCache, FlushApiCache, EvaluateCode, TagResource, UntagResource, ListTagsForResource; **Event APIs**: CreateApi, GetApi, ListApis, UpdateApi, DeleteApi, CreateChannelNamespace, GetChannelNamespace, ListChannelNamespaces, UpdateChannelNamespace, DeleteChannelNamespace, CreateApiKey, ListApiKeys, DeleteApiKey, HTTP Publish, WebSocket subscribe/publish | GraphQL execution goes through `graphql-core` when the API has a schema (parse, validate, execute; an AppSync prelude supplies the `AWS*` scalars and `@aws_*` directives; a schemaless API keeps a lenient path); **`APPSYNC_JS` resolvers execute** — unit and pipeline, `util`/`runtime`/`extensions` globals, the `@aws-appsync/utils/dynamodb` helpers, `NONE`/`HTTP`/`AMAZON_DYNAMODB`/`AWS_LAMBDA` data sources — on a pool of warm Node workers (one evaluation in flight per worker, 30s bound with kill-and-respawn, heap cap; reuses the image's Node, no new dependency); `GetIntrospectionSchema` serves SDL or a real `format=JSON` introspection document; the API cache is honored by the data plane under `FULL_REQUEST_CACHING` and `PER_RESOLVER_CACHING`; a data-plane request satisfying none of the API's auth modes answers `401 UnauthorizedException`, as on AWS (credentials are not verified — only their absence is refused). Event APIs support AWS-shaped `/v2/apis` management, `/v1/apis/{apiId}/apikeys` API-key operations, `POST /event` on `*.appsync-api.*`, and realtime `*.appsync-realtime-api.*` WebSocket flows with API-key and Lambda-authorizer checks |
 | **Cloud Map** | CreateHttpNamespace, CreatePrivateDnsNamespace, CreatePublicDnsNamespace, GetNamespace, ListNamespaces, DeleteNamespace, UpdateHttpNamespace, UpdatePrivateDnsNamespace, UpdatePublicDnsNamespace, CreateService, GetService, ListServices, DeleteService, UpdateService, RegisterInstance, DeregisterInstance, DiscoverInstances, DiscoverInstancesRevision, ListInstances, GetInstancesHealthStatus, UpdateInstanceCustomHealthStatus, GetServiceAttributes, UpdateServiceAttributes, DeleteServiceAttributes, GetOperation, ListOperations, TagResource, UntagResource, ListTagsForResource | DNS namespaces create Route53 hosted zones; operation tracking; Terraform `aws_service_discovery_*` compatible |
 | **RDS Data API** | ExecuteStatement, BatchExecuteStatement, BeginTransaction, CommitTransaction, RollbackTransaction | Routes SQL to real Docker-backed RDS database containers; supports MySQL (pymysql) and PostgreSQL (psycopg2); REST paths (`/Execute`, `/BeginTransaction`, etc.) |
@@ -1345,7 +1350,7 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (5,700+ tests across all services)
+# Run the full test suite (7,500+ tests across all services)
 pytest tests/ -v
 ```
 
@@ -1523,57 +1528,75 @@ See [`Testcontainers/java-testcontainers`](Testcontainers/java-testcontainers), 
 
 ## Comparison
 
-| Feature | MiniStack | LocalStack Free | LocalStack Pro |
-|---------|-----------|-----------------|----------------|
-| S3, SQS, SNS, DynamoDB | ✅ | ✅ | ✅ |
-| **DynamoDB Streams** | ✅ | ✅ | ✅ |
-| Lambda (Python + Node.js execution) | ✅ | ✅ | ✅ |
-| IAM, STS, SecretsManager | ✅ | ✅ | ✅ |
-| CloudWatch Logs | ✅ | ✅ | ✅ |
-| SSM Parameter Store | ✅ | ✅ | ✅ |
-| EventBridge | ✅ | ✅ | ✅ |
-| Kinesis | ✅ | ✅ | ✅ |
-| SES | ✅ | ✅ | ✅ |
-| Step Functions | ✅ | ✅ | ✅ |
-| **RDS (real DB containers)** | ✅ | ❌ | ✅ |
-| **Aurora DSQL (real PG + SQL-subset enforcement)** | ✅ | ❌ | ✅ (permissive — no dialect enforcement) |
-| **ElastiCache (real Redis)** | ✅ | ❌ | ✅ |
-| **ECS (real Docker containers)** | ✅ | ❌ | ✅ |
-| **Athena (real SQL via DuckDB)** | ✅ | ❌ | ✅ |
-| **Glue Data Catalog + Jobs** | ✅ | ❌ | ✅ |
-| **API Gateway v2 (HTTP API)** | ✅ | ✅ | ✅ |
-| **API Gateway v2 (WebSocket API)** | ✅ | ❌ | ✅ |
-| **API Gateway v1 (REST API)** | ✅ | ✅ | ✅ |
-| **Firehose** | ✅ | ✅ | ✅ |
-| **Bedrock (Converse / InvokeModel / Agents)** | ✅ | ❌ | ✅ |
-| **MSK (Kafka control plane)** | ✅ | ❌ | ✅ |
-| **Multi-region state isolation** | ✅ | ✅ | ✅ |
-| **Route53** | ✅ | ✅ | ✅ |
-| **Cognito** | ✅ | ✅ | ✅ |
-| **EC2** | ✅ | ✅ | ✅ |
-| **EMR** | ✅ | Paid | ✅ |
-| **ELBv2 / ALB** | ✅ | ✅ | ✅ |
-| **EBS** | ✅ | Paid | ✅ |
-| **EFS** | ✅ | Paid | ✅ |
-| **ACM** | ✅ | ✅ | ✅ |
-| **SES v2** | ✅ | ✅ | ✅ |
-| **WAF v2** | ✅ | Paid | ✅ |
-| **CloudFormation** | **partial** | partial | ✅ |
-| **KMS** | ✅ | Paid | ✅ |
-| **ECR** | ✅ | ✅ | ✅ |
-| **CloudFront** | ✅ | Paid | ✅ |
-| **AppSync** | ✅ | ❌ | ✅ |
-| **Cloud Map** | ✅ | ❌ | ✅ |
-| **CodeBuild** | ✅ | ✅ | ✅ |
-| **Transfer Family** | ✅ | ❌ | ❌ |
-| **Inspector2** | ✅ | ❌ | ❌ |
-| **IoT Core** | ✅ (control + WS data plane) | ❌ | ✅ (paid tier) |
-| **S3 Files** | ✅ | ❌ | ❌ |
-| Cost | **Free forever** | Was free, now paid | $35+/mo |
-| Docker image size | ~270MB | ~1GB | ~1GB |
-| Memory at idle | ~30MB | ~500MB | ~500MB |
-| Startup time | <2s | ~15-30s | ~15-30s |
-| License | MIT | BSL (restricted) | Proprietary |
+Compared against LocalStack for AWS as documented on its [pricing](https://www.localstack.cloud/pricing) and [plans](https://docs.localstack.cloud/aws/licensing/) pages (checked 2 October 2026).
+
+### Plans and terms
+
+| | MiniStack | LocalStack Hobby (free) | LocalStack Base | LocalStack Ultimate |
+|---|---|---|---|---|
+| Price | Free | Free | $39 per license per month billed annually ($45 monthly) | $89 per license per month billed annually |
+| Commercial use | Yes | No, non-commercial only | Yes | Yes |
+| Account and auth token | Not needed | Required, also in CI | Required | Required |
+| License | MIT | Proprietary image | Proprietary image | Proprietary image |
+| Services LocalStack advertises | n/a | 30+ | 55+ | 110+ |
+| Local state persistence | Yes (`PERSIST_STATE=1`) | No | Yes | Yes |
+| Multi-account and multi-region isolation | Yes | Yes | Yes | Yes |
+| Docker image size | ~270MB | ~1GB | ~1GB | ~1GB |
+| Memory at idle | ~30MB | ~500MB | ~500MB | ~500MB |
+| Startup time | <2s | ~15-30s | ~15-30s | ~15-30s |
+
+LocalStack also sells an Enterprise plan with custom pricing, air-gapped delivery and Kubernetes deployment. MiniStack has no paid tier.
+
+### Service coverage by LocalStack plan
+
+The "LocalStack plan" column is the lowest plan that includes the service on LocalStack's plans page. This table compares which services exist on each side. It does not compare operation-level depth. LocalStack has had longer to cover individual APIs, and MiniStack has not benchmarked itself against it operation by operation.
+
+| Service | MiniStack | LocalStack plan |
+|---------|-----------|-----------------|
+| S3, SQS, SNS, DynamoDB, DynamoDB Streams | ✅ | Hobby |
+| Lambda, EC2, Step Functions, EventBridge, EventBridge Scheduler | ✅ | Hobby |
+| IAM, STS, KMS, Secrets Manager, ACM | ✅ | Hobby |
+| CloudFormation, Cloud Control, AWS Config, Resource Groups | ✅ | Hobby |
+| CloudWatch Metrics and Logs, SSM Parameter Store | ✅ | Hobby |
+| Kinesis, Firehose, OpenSearch | ✅ | Hobby |
+| SES v1, Route 53, Transcribe, API Gateway REST (v1) | ✅ | Hobby |
+| SES v2, Amazon MQ | ✅ | Base |
+| API Gateway v2 (HTTP and WebSocket) and Management API | ✅ | Base |
+| ECS, ECR | ✅ | Base |
+| RDS, RDS Data API, ElastiCache | ✅ | Base |
+| ELB and ELBv2, CloudFront | ✅ | Base |
+| Cognito User Pools and Identity Pools | ✅ | Base |
+| IoT Core | ✅ | Base |
+| EC2 Auto Scaling, AppConfig, CodeBuild | ✅ | Base |
+| Athena, Glue, EMR | ✅ | Ultimate |
+| MSK, MWAA, EventBridge Pipes | ✅ | Ultimate |
+| EKS, Batch | ✅ | Ultimate |
+| AppSync, CloudFront KeyValueStore, Cloud Map | ✅ | Ultimate |
+| Bedrock and Bedrock Runtime | ✅ | Ultimate |
+| WAF v2, CloudTrail, Organizations, Account | ✅ | Ultimate |
+| EFS, S3 Files, AWS Backup | ✅ | Ultimate |
+| Transfer Family, IoT Data, IoT Wireless | ✅ | Ultimate |
+| Route 53 Resolver, S3 Control, SWF, Redshift, Support API | ❌ | Hobby |
+| Application Auto Scaling, CodeArtifact, CodeCommit, CodeConnections | ❌ | Base |
+| Amplify, CodeDeploy, CodePipeline, X-Ray, Fault Injection Service | ❌ | Ultimate |
+| DocumentDB, MemoryDB, Neptune, Timestream, DMS | ❌ | Ultimate |
+| SageMaker, Textract, Pinpoint, MediaConvert, Glacier | ❌ | Ultimate |
+| EMR Serverless, Lake Formation, Managed Flink, Redshift Data API | ❌ | Ultimate |
+| IAM Identity Center and Identity Store, RAM, Shield, Private CA, Verified Permissions | ❌ | Ultimate |
+| Cost Explorer, Elastic Beanstalk, Serverless Application Repo, Managed Blockchain | ❌ | Ultimate |
+| Aurora DSQL, S3 Tables | ✅ | not listed |
+| Bedrock Agent, Agent Runtime and AgentCore | ✅ | not listed |
+| Translate, Signer, Inspector2, Cost and Usage Reports | ✅ | not listed |
+| Amazon Location (trackers), MediaConnect, Lambda MicroVMs | ✅ | not listed |
+| WAF Classic, Resource Groups Tagging API | ✅ | not listed |
+
+### What differs in behavior
+
+- **Real backends:** RDS and Aurora DSQL start Postgres or MySQL containers, ElastiCache starts Redis, Valkey or Memcached, ECS runs Docker containers, EKS starts k3s, Athena queries through DuckDB, MWAA starts Airflow, and Transfer Family serves SFTP backed by S3. The Docker-backed services need the Docker socket mounted. Athena needs the `full` image.
+- **Bedrock:** Converse and InvokeModel return deterministic mock responses by default. Set `MINISTACK_BEDROCK_PROXY_URL` to forward them to Ollama, llama.cpp or vLLM.
+- **Stubs:** EMR, Batch, AWS Backup, MediaConnect, Amazon MQ and Lambda MicroVMs are control-plane only. Each Supported Services row states what runs.
+- **LocalStack-only features:** advanced IAM policy testing as a product feature, the live AWS resource replicator, Cloud Pods and hosted sandboxes have no MiniStack equivalent. MiniStack evaluates IAM policies when `AUTH=true`.
+- **Migration:** MiniStack answers `/_localstack/health`, accepts `EDGE_PORT`, `USE_SSL` and `LOCALSTACK_SFN_MOCK_CONFIG`, and reads LocalStack init-script paths (`/etc/localstack/init/{boot,ready}.d`). The `ls-custom-id` tag is not recognised, so use `ms-custom-id`.
 
 ---
 
@@ -1589,14 +1612,15 @@ See [`Testcontainers/java-testcontainers`](Testcontainers/java-testcontainers), 
 
 ## Contributing
 
-PRs welcome. The codebase is intentionally simple — each service is a single self-contained Python file in `ministack/services/`. Adding a new service means:
+PRs welcome. Open a scoped issue before adding a new AWS service or changing infrastructure (Dockerfiles, CI, dependencies). Adding a service means:
 
-1. Create `ministack/services/myservice.py` with an `async def handle_request(...)` function and a `reset()` function
+1. Create `ministack/services/myservice.py` with an `async def handle_request(...)` function, plus `get_state()`, `load_persisted_state(data)` and `reset()`, which the registry and `tests/test_persistence.py` enforce
 2. Add it to `SERVICE_REGISTRY` in `ministack/app.py` so the handler, aliases, and service filter are generated automatically
 3. Add detection patterns to `ministack/core/router.py`
-4. Add a fixture to `tests/conftest.py` and tests to `tests/test_services.py`
+4. Add a fixture to `tests/conftest.py` and tests in `tests/test_<service>.py`
+5. Add the service to the table in this README and a `CHANGELOG.md` entry
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for a full walkthrough.
+Run `ruff check ministack/` and the relevant tests before opening a PR. See [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) for the full process.
 
 ---
 
