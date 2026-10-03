@@ -405,3 +405,18 @@ exports.handler = async () => ({ ok: true });
     assert "@aws-sdk/client-no-local-stub" in message
     assert "LAMBDA_EXECUTOR=docker" in message
     assert "Cannot find module" not in message
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_node_worker_cwd_is_code_dir():
+    """process.cwd() must be the extracted code root, as on AWS (LAMBDA_TASK_ROOT)."""
+    worker = _node_worker(
+        "exports.handler = async () => ({ cwd: process.cwd(), root: process.env.LAMBDA_TASK_ROOT });"
+    )
+    try:
+        result = worker.invoke({}, request_id="cwd-request-id")
+    finally:
+        worker.kill()
+
+    assert result["status"] == "ok", result
+    assert result["result"]["cwd"] == result["result"]["root"]
