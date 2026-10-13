@@ -733,6 +733,26 @@ def _function_summary_builder(fn: dict, stage: str, status: str, last_modified: 
     return build
 
 
+def _function_arns_in(dist):
+    try:
+        root = fromstring(dist.get("config_xml") or "")
+    except Exception:
+        return set()
+    return {el.text for el in root.iter() if el.tag.split("}")[-1] == "FunctionARN" and el.text}
+
+
+def _function_dev_status(fn):
+    """DEVELOPMENT-stage Status: UNPUBLISHED until PublishFunction has copied
+    the current development version to LIVE (an UpdateFunction since then makes
+    it UNPUBLISHED again), then ASSOCIATED while a distribution's cache behavior
+    references the function and UNASSOCIATED otherwise."""
+    if not fn.get("live_etag") or fn.get("published_dev_etag") != fn["dev_etag"]:
+        return "UNPUBLISHED"
+    if any(fn["arn"] in _function_arns_in(d) for d in _distributions.values()):
+        return "ASSOCIATED"
+    return "UNASSOCIATED"
+
+
 def _cf_parse_function_config(cfg_el):
     if cfg_el is None:
         return None, _error("InvalidArgument", "FunctionConfig is required.", 400)
@@ -794,6 +814,8 @@ def _cf_create_function(headers, body):
         "last_modified_live": None,
         "dev_etag": dev_etag,
         "live_etag": None,
+        # The dev_etag PublishFunction last copied to LIVE (see _function_dev_status).
+        "published_dev_etag": None,
         # The body PublishFunction froze; LIVE serves this, not the working copy.
         "live_body": None,
     }
@@ -816,7 +838,7 @@ def _cf_list_functions(query_params):
     summaries = []
     for fn in _functions.values():
         if stage_filter in ("", "DEVELOPMENT"):
-            summaries.append((fn, "DEVELOPMENT", "UNPUBLISHED", fn["last_modified_dev"]))
+            summaries.append((fn, "DEVELOPMENT", _function_dev_status(fn), fn["last_modified_dev"]))
         if stage_filter in ("", "LIVE") and fn["live_etag"]:
             summaries.append((fn, "LIVE", "DEPLOYED", fn["last_modified_live"] or fn["last_modified_dev"]))
 
@@ -847,7 +869,7 @@ def _cf_describe_function(name: str, stage: str):
     elif stage == "DEVELOPMENT":
         etag = fn["dev_etag"]
         lm = fn["last_modified_dev"]
-        st = "UNPUBLISHED"
+        st = _function_dev_status(fn)
     else:
         return _error("InvalidArgument", "Invalid Stage value.", 400)
 
@@ -893,6 +915,7 @@ def _cf_publish_function(name: str, headers):
     now = _now_iso()
     fn["live_etag"] = new_uuid()
     fn["last_modified_live"] = now
+    fn["published_dev_etag"] = fn["dev_etag"]
     # Publishing copies DEVELOPMENT to LIVE; later updates to the development
     # body must not reach the stage that is serving traffic.
     fn["live_body"] = {
