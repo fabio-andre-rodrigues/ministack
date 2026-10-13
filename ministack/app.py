@@ -2140,12 +2140,18 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
 
     # IAM enforcement for S3 virtual-hosted requests
     if AUTH:
-        from ministack.core.iam_actions import _s3_action, extract_resource_arn, s3_additional_checks
+        from ministack.core.iam_actions import (
+            _s3_action,
+            extract_resource_arn,
+            s3_additional_checks,
+            s3_service_context,
+        )
 
         s3_action = _s3_action(method, vhost_path, query_params)
         if s3_action:
             s3_resource = extract_resource_arn("s3", method, vhost_path, headers, body, query_params, "", "")
-            denied = _enforce_data_plane("s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=s3_resource)
+            denied = _enforce_data_plane("s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=s3_resource,
+                                         service_context=s3_service_context(f"s3:{s3_action}", query_params) or None)
             if denied:
                 return denied
             # A copy also reads its source, a batch delete is one check per
@@ -2598,6 +2604,7 @@ async def _dispatch_service_request(
             extract_iam_action,
             extract_resource_arn,
             logs_service_context,
+            s3_service_context,
         )
         from ministack.core.iam_evaluator import AuthError, enforce, pin_request_caller
         from ministack.core.responses import get_account_id
@@ -2609,9 +2616,11 @@ async def _dispatch_service_request(
             resource_arn = extract_resource_arn(
                 service, method, path, headers, body, routing_params, region, get_account_id()
             )
-            service_context = (
-                dynamodb_service_context(body) if service == "dynamodb" else None
-            )
+            service_context = None
+            if service == "dynamodb":
+                service_context = dynamodb_service_context(body)
+            elif service == "s3":
+                service_context = s3_service_context(iam_action, routing_params) or None
             if service == "logs":
                 from ministack.services import cloudwatch_logs
 

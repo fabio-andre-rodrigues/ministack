@@ -4991,3 +4991,69 @@ def test_stage_policy_is_enforced_on_dispatch(monkeypatch, prefix, suffix, case,
     assert bool(dispatched) == (expected == 200)
     if expected == 403:
         assert f"apigateway:{method}" in json.loads(body)["message"]
+
+
+@pytest.mark.parametrize("action,query,expected", [
+    ("s3:ListBucket", {"list-type": ["2"], "prefix": ["home/alice/"]}, {"s3:prefix": "home/alice/"}),
+    ("s3:ListBucketVersions", {"versions": [""], "prefix": ["home/alice/"]}, {"s3:prefix": "home/alice/"}),
+    ("s3:ListBucket", {"prefix": [""]}, {"s3:prefix": ""}),
+    ("s3:ListBucket", {"list-type": ["2"]}, {}),
+    ("s3:GetObject", {"prefix": ["home/alice/"]}, {}),
+])
+def test_s3_service_context_prefix(action, query, expected):
+    from ministack.core.iam_actions import s3_service_context
+
+    assert s3_service_context(action, query) == expected
+
+
+def test_s3_prefix_condition_scopes_list_bucket(monkeypatch):
+    """#2172: a ListBucket grant conditioned on s3:prefix matches the request's
+    prefix parameter, path-style and virtual-hosted, as on AWS."""
+    import ministack.app as app
+    from ministack.services import iam as iam_svc
+
+    fake_key = "AKIATESTS3PREFIX001"
+    iam_svc._access_keys[fake_key] = {
+        "UserName": "alice", "AccessKeyId": fake_key,
+        "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+    }
+    iam_svc._users["alice"] = {
+        "UserName": "alice", "Arn": "arn:aws:iam::000000000000:user/alice",
+        "UserId": "AIDAALICE1", "CreateDate": "2024-01-01", "Path": "/",
+        "AttachedPolicies": [], "Tags": [],
+    }
+    iam_svc._user_inline_policies["alice"] = {"p": json.dumps({"Statement": [{
+        "Effect": "Allow", "Action": ["s3:ListBucket", "s3:ListBucketVersions"],
+        "Resource": "arn:aws:s3:::bucket",
+        "Condition": {"StringLike": {"s3:prefix": ["home/alice/*"]}}}]})}
+
+    async def s3_handler(method, path, headers, body, query):
+        return 200, {"Content-Type": "application/xml"}, b""
+
+    monkeypatch.setattr(app, "AUTH", True)
+    monkeypatch.setitem(app.SERVICE_HANDLERS, "s3", s3_handler)
+    headers = {
+        "authorization": f"AWS4-HMAC-SHA256 Credential={fake_key}/20261013/us-east-1/s3/aws4_request, "
+                         "SignedHeaders=host, Signature=deadbeef",
+        "host": "localhost:4566",
+    }
+
+    def path_style(query):
+        return asyncio.run(app._dispatch_service_request("GET", "/bucket", headers, b"", query, "rid"))[0]
+
+    def vhost(query):
+        vhost_headers = {**headers, "host": "bucket.localhost:4566"}
+        return asyncio.run(app._handle_s3_vhost_request("bucket.localhost:4566", "/", "GET", vhost_headers,
+                                                        b"", query))[0]
+
+    try:
+        assert path_style({"list-type": ["2"], "prefix": ["home/alice/"]}) == 200
+        assert path_style({"versions": [""], "prefix": ["home/alice/docs/"]}) == 200
+        assert path_style({"list-type": ["2"], "prefix": ["home/bob/"]}) == 403
+        assert path_style({"list-type": ["2"]}) == 403
+        assert vhost({"list-type": ["2"], "prefix": ["home/alice/"]}) != 403
+        assert vhost({"list-type": ["2"], "prefix": ["home/bob/"]}) == 403
+    finally:
+        iam_svc._access_keys.pop(fake_key, None)
+        iam_svc._users.pop("alice", None)
+        iam_svc._user_inline_policies.pop("alice", None)

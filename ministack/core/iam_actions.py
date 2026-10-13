@@ -1788,6 +1788,23 @@ def dynamodb_transaction_checks(
     return checks
 
 
+def s3_service_context(iam_action: str, query_params: dict | None) -> dict:
+    """The S3 request condition keys for an action.
+
+    ``s3:prefix`` holds a ListBucket or ListBucketVersions request's ``prefix``
+    parameter, per AWS's "Amazon S3 condition key examples", so a grant scoped
+    to ``home/alice/*`` matches a listing of that folder (#2172). A request
+    without the parameter leaves the key unset."""
+    if iam_action not in ("s3:ListBucket", "s3:ListBucketVersions") or not query_params:
+        return {}
+    prefix = query_params.get("prefix")
+    if prefix is None:
+        return {}
+    if isinstance(prefix, list):
+        prefix = prefix[0] if prefix else ""
+    return {"s3:prefix": prefix}
+
+
 def dynamodb_service_context(body: bytes) -> dict:
     """The DynamoDB condition keys a request carries.
 
