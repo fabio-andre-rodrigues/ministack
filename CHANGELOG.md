@@ -7,6 +7,22 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **S3 Control — Multi-Region Access Points** — `CreateMultiRegionAccessPoint`, `DeleteMultiRegionAccessPoint`, `PutMultiRegionAccessPointPolicy`, `DescribeMultiRegionAccessPointOperation`, `GetMultiRegionAccessPoint`, `GetMultiRegionAccessPointPolicy`, `ListMultiRegionAccessPoints`, `GetMultiRegionAccessPointRoutes` and `SubmitMultiRegionAccessPointRoutes`. The async operations apply at once and `Describe` reports `SUCCEEDED`, or `FAILED` with AWS's `ErrorDetails` for a missing bucket, two buckets in one region or a name already in use. Management is served from `us-west-2` and route operations from `us-east-1`, `us-west-2`, `eu-west-1`, `ap-northeast-1` and `ap-southeast-2`, as on AWS; other regions get `301 PermanentRedirect`. `DeleteBucket` on a member returns `BucketHasAccessPointsAttached`. Under `AUTH=true` each operation needs its `s3:` IAM action. Access points from `AWS::S3::MultiRegionAccessPoint` appear in the API.
+- **S3 — Multi-Region Access Point failover** — a request through the MRAP host goes to the member with a traffic dial of 100 that is homed in `MINISTACK_REGION`, else the first active member. Setting a dial to 0 moves traffic to the other member, and an update that leaves every dial at 0 is refused.
+- **CloudFormation — `DescribeEvents`** — returns the validation errors of a create that fails pre-deployment validation, which the stack's `CREATE_FAILED` event tells the caller to look up.
+- **CloudFormation — `CFN_S3_ADOPT_EXISTING_BUCKET`** — `AWS::S3::Bucket` adopts an own bucket that already exists by default, so S3 data that outlives the stack store stays usable. `CFN_S3_ADOPT_EXISTING_BUCKET=0` fails the create the way AWS does, and auto-named buckets get a new name for each stack instance.
+
+### Fixed
+- **S3 — bucket home region is enforced** — a request signed for a region other than the bucket's now returns `301 PermanentRedirect` with `x-amz-bucket-region`, which SDKs follow; at the bucket's own regional endpoint it returns `400 AuthorizationHeaderMalformed` or, presigned, `AuthorizationQueryParametersError`, with `<Region>`. HEAD gets the bodiless forms. `GetBucketLocation`, `ListBuckets`, `CreateBucket`, unsigned, SigV2 and SigV4a requests, MRAP requests and internal callers are exempt, and `CopyObject` from a source in another region still works.
+- **S3 — `CreateBucket` location constraint (breaking)** — a request signed for a region other than `us-east-1` must name that region as `LocationConstraint`, or gets `IllegalLocationConstraintException`; `LocationConstraint=us-east-1` returns `InvalidLocationConstraint`. Clients that created buckets in another region without a constraint now need one. `BucketAlreadyOwnedByYou` and `BucketAlreadyExists` carry AWS's message and `<BucketName>`.
+- **S3 — `ListBuckets` `bucket-region` filter** — `BucketRegion` lists only that region's buckets, with pagination inside the filter; a filter for another region than the endpoint's returns `InvalidArgument`.
+- **S3 — replication** — delete markers replicate for V2 rules with `DeleteMarkerReplication` enabled and no tag filter, from `DeleteObject` and `DeleteObjects`; version-id deletes don't. Rules with `Filter.Tag` or `Filter.And.Tags` replicate only objects carrying those tags.
+- **SigV4a requests no longer land in region `s3`** — the region was read from a credential scope that SigV4a doesn't have; a single-region `X-Amz-Region-Set` is used, else the default region.
+- **Lambda — S3 code from another region** — `CreateFunction`, `UpdateFunctionCode`, `PublishLayerVersion` and CloudFormation return AWS's `InvalidParameterValueException` when the code bucket is homed elsewhere.
+- **Resource Groups Tagging — S3 buckets by region** — `GetResources`, `GetTagKeys` and `GetTagValues` list only buckets homed in the region they are called in.
+- **CloudFormation — `AWS::S3::Bucket` and existing names** — a `BucketName` another account owns used to become a second bucket of that name; it now fails pre-deployment validation with `NAME_CONFLICT_VALIDATION`, as on AWS. With rollback disabled, a failed validation emits AWS's second `CREATE_FAILED` event.
+
 ## [1.5.27] — 2026-10-13
 
 ### Added
