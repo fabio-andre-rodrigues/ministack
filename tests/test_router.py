@@ -584,6 +584,8 @@ _SIGV4A_AUTH = (
     ({"authorization": _SIGV4_AUTH.format(region="eu-west-1")}, None, "eu-west-1"),
     ({}, {"X-Amz-Algorithm": ["AWS4-HMAC-SHA256"],
           "X-Amz-Credential": ["AKID/20261012/ap-south-1/s3/aws4_request"]}, "ap-south-1"),
+    ({}, {"X-Amz-Credential": ["AKID/20261012/us-west-2/appsync/aws4_request"]}, "us-west-2"),
+    ({}, {"X-Amz-Credential": ["AKID/20261012/s3/aws4_request"]}, None),
     ({"authorization": _SIGV4A_AUTH, "x-amz-region-set": "eu-west-1"}, None, "eu-west-1"),
     ({"authorization": _SIGV4A_AUTH, "x-amz-region-set": "*"}, None, None),
     ({"authorization": _SIGV4A_AUTH, "x-amz-region-set": "us-east-1,eu-west-1"}, None, None),

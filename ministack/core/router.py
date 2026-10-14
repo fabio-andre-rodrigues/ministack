@@ -1414,13 +1414,14 @@ def extract_signed_region(headers: dict, query_params=None) -> str | None:
     if auth.startswith("AWS4-ECDSA-P256-SHA256"):
         return _single_region(headers.get("x-amz-region-set", ""))
     algorithm = _query_value(query_params, "X-Amz-Algorithm")
-    if algorithm == "AWS4-HMAC-SHA256":
+    if algorithm == "AWS4-ECDSA-P256-SHA256":
+        return _single_region(_query_value(query_params, "X-Amz-Region-Set"))
+    # A bare X-Amz-Credential (no algorithm) still names its region, as
+    # IoT WebSocket and AppSync clients send it.
+    if algorithm in ("", "AWS4-HMAC-SHA256"):
         parts = _credential_from_query(query_params).split("/")
         if len(parts) == 5 and parts[2] and parts[4] == "aws4_request":
             return parts[2]
-        return None
-    if algorithm == "AWS4-ECDSA-P256-SHA256":
-        return _single_region(_query_value(query_params, "X-Amz-Region-Set"))
     return None
 
 
