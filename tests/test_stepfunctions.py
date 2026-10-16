@@ -105,9 +105,13 @@ def test_sfn_state_machines_are_region_scoped():
     assert west_sm["stateMachineArn"] in west_arns
     assert west_sm["stateMachineArn"] not in east_arns
 
+    # Real AWS evaluates authorization before existence on
+    # DescribeStateMachine: an arn that does not exist in this region
+    # answers AccessDeniedException, not StateMachineDoesNotExist
+    # (real-AWS capture).
     with pytest.raises(ClientError) as exc:
         west.describe_state_machine(stateMachineArn=east_sm["stateMachineArn"])
-    assert exc.value.response["Error"]["Code"] == "StateMachineDoesNotExist"
+    assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
 
 
 def test_sfn_executions_are_region_scoped():
@@ -2569,6 +2573,116 @@ def test_sfn_aws_sdk_ec2_irregular_set_members_use_sdk_names(sfn_sync, ec2):
         assert any(k["KeyName"] == f"sdk-key-{suffix}" for k in result["KeyPairs"])
     finally:
         ec2.delete_key_pair(KeyName=f"sdk-key-{suffix}")
+
+
+_SDK_TIMESTAMP = r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$"
+
+
+def test_sfn_aws_sdk_sfn_list_executions_nested_shape(sfn_sync):
+    """Nested members of a JSON-protocol result take the SDK's names, timestamps
+    are ISO 8601 and an absent stopDate is left out, as on AWS."""
+    import re
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    with _machine(sfn_sync, "Wait", {"Wait": {"Type": "Wait", "Seconds": 3600, "End": True}}) as target:
+        sfn_sync.start_execution(stateMachineArn=target, name="single-1")
+        result = _run_sdk_task(sfn_sync, f"sdk-list-{suffix}", "sfn:listExecutions",
+                               {"StateMachineArn": target, "StatusFilter": "RUNNING"})
+
+    [execution] = result["Executions"]
+    assert sorted(execution) == ["ExecutionArn", "Name", "StartDate", "StateMachineArn", "Status"]
+    assert execution["Name"] == "single-1"
+    assert execution["Status"] == "RUNNING"
+    assert re.match(_SDK_TIMESTAMP, execution["StartDate"]), execution["StartDate"]
+
+
+def test_sfn_aws_sdk_dynamodb_get_item_keeps_attribute_names(sfn_sync, ddb):
+    """Attribute names are map keys and stay as written at every depth, while the
+    AttributeValue members take the SDK's names. The expected item is what AWS
+    returned for the same put."""
+    table = f"sdk-item-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    try:
+        ddb.put_item(TableName=table, Item={
+            "pk": {"S": "k"}, "num": {"N": "7"}, "flag": {"BOOL": True}, "nothing": {"NULL": True},
+            "set": {"SS": ["a", "b"]}, "nums": {"NS": ["1"]},
+            "nested": {"M": {"innerKey": {"S": "v"}, "UPPER_key": {"N": "1"}}},
+            "list": {"L": [{"S": "x"}]},
+        })
+        result = _run_sdk_task(sfn_sync, f"{table}-get", "dynamodb:getItem",
+                               {"TableName": table, "Key": {"pk": {"S": "k"}}})
+    finally:
+        ddb.delete_table(TableName=table)
+
+    assert result["Item"] == {
+        "pk": {"S": "k"}, "num": {"N": "7"}, "flag": {"Bool": True}, "nothing": {"Nul": True},
+        "set": {"Ss": ["a", "b"]}, "nums": {"Ns": ["1"]},
+        "nested": {"M": {"innerKey": {"S": "v"}, "UPPER_key": {"N": "1"}}},
+        "list": {"L": [{"S": "x"}]},
+    }
+
+
+def test_sfn_aws_sdk_json_results_rename_nested_members(sfn_sync, sm):
+    """An ARN member nested in a list becomes Arn, map keys such as version ids
+    stay as sent, and tag lists keep their Key/Value members."""
+    import re
+
+    name = f"sdk-secret-{_uuid_mod.uuid4().hex[:8]}"
+    version = sm.create_secret(Name=name, SecretString="x",
+                               Tags=[{"Key": "owner", "Value": "probe"}])["VersionId"]
+    try:
+        result = _run_sdk_task(sfn_sync, f"{name}-list", "secretsmanager:listSecrets",
+                               {"Filters": [{"Key": "name", "Values": [name]}]})
+    finally:
+        sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+    [secret] = result["SecretList"]
+    assert secret["Arn"].startswith(f"arn:aws:secretsmanager:us-east-1:000000000000:secret:{name}")
+    assert "ARN" not in secret
+    assert re.match(_SDK_TIMESTAMP, secret["CreatedDate"]), secret["CreatedDate"]
+    assert secret["Tags"] == [{"Key": "owner", "Value": "probe"}]
+    assert secret["SecretVersionsToStages"] == {version: ["AWSCURRENT"]}
+
+
+def test_sfn_aws_sdk_ecs_and_ecr_parameters_reach_the_service(sfn_sync, ecs, ecr):
+    """SDK member names in Parameters reach a camelCase-wire service under its wire names."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    cluster, repo_a, repo_b = f"sdk-cl-{suffix}", f"sdk-repo-a-{suffix}", f"sdk-repo-b-{suffix}"
+    ecs.create_cluster(clusterName=cluster)
+    ecr.create_repository(repositoryName=repo_a)
+    ecr.create_repository(repositoryName=repo_b)
+    try:
+        clusters = _run_sdk_task(sfn_sync, f"sdk-ecs-{suffix}", "ecs:describeClusters", {"Clusters": [cluster]})
+        assert [c["ClusterName"] for c in clusters["Clusters"]] == [cluster]
+        missing = _run_sdk_task(sfn_sync, f"sdk-ecs-miss-{suffix}", "ecs:describeClusters",
+                                {"Clusters": [f"{cluster}-missing"]})
+        [failure] = missing["Failures"]
+        assert failure["Arn"].endswith(f"cluster/{cluster}-missing")
+        repos = _run_sdk_task(sfn_sync, f"sdk-ecr-{suffix}", "ecr:describeRepositories",
+                              {"RepositoryNames": [repo_a]})
+        assert [r["RepositoryName"] for r in repos["Repositories"]] == [repo_a]
+    finally:
+        ecs.delete_cluster(cluster=cluster)
+        ecr.delete_repository(repositoryName=repo_a)
+        ecr.delete_repository(repositoryName=repo_b)
+
+
+def test_sfn_aws_sdk_cloudwatchlogs_tag_keys_keep_their_case(sfn_sync, logs):
+    """Map keys in Parameters are data: tag keys reach the service as written."""
+    group = f"/sdk/tags-{_uuid_mod.uuid4().hex[:8]}"
+    logs.create_log_group(logGroupName=group)
+    try:
+        arn = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["arn"].removesuffix(":*")
+        _run_sdk_task(sfn_sync, f"sdk-logs-tag-{group[-8:]}", "cloudwatchlogs:tagResource",
+                      {"ResourceArn": arn, "Tags": {"Team-Name": "data", "CostCentre": "42"}})
+        assert logs.list_tags_for_resource(resourceArn=arn)["tags"] == {"Team-Name": "data", "CostCentre": "42"}
+    finally:
+        logs.delete_log_group(logGroupName=group)
 
 
 def test_sfn_aws_sdk_rds_create_and_describe_instance(sfn, sfn_sync):
@@ -5414,13 +5528,15 @@ def test_sfn_create_idempotency_covers_version_description(sfn):
 
 
 def test_sfn_describe_not_found(sfn):
-    """DescribeStateMachine on non-existent ARN should fail."""
+    """DescribeStateMachine on a non-existent ARN: real AWS evaluates
+    authorization before existence and answers AccessDeniedException
+    (real-AWS capture), not StateMachineDoesNotExist."""
     with pytest.raises(ClientError) as exc:
         sfn.describe_state_machine(stateMachineArn="arn:aws:states:us-east-1:000000000000:stateMachine:nonexistent-99")
     err = exc.value.response["Error"]["Code"]
-    assert "StateMachineDoesNotExist" in err or "NotFound" in err or "ResourceNotFound" in err
+    assert err == "AccessDeniedException"
     # Real AWS sends `x-amzn-errortype` on JSON-protocol errors; Java/Go SDK v2 read it.
-    assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "StateMachineDoesNotExist"
+    assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "AccessDeniedException"
 
 def test_sfn_start_execution_not_found(sfn):
     """StartExecution on non-existent SM should fail."""

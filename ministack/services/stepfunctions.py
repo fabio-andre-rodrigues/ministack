@@ -52,6 +52,7 @@ from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
+    _service_model,
     error_response_json,
     get_account_id,
     get_region,
@@ -514,9 +515,15 @@ def _describe_state_machine(data):
             "loggingConfiguration": base_sm.get("loggingConfiguration", {"level": "OFF"}),
             "revisionId": base_sm.get("revisionId", ""),
         })
+    # Real AWS evaluates authorization before existence on
+    # DescribeStateMachine: a stateMachineArn that resolves to nothing
+    # (no machine, version, or alias) answers AccessDeniedException, not
+    # StateMachineDoesNotExist (real AWS wire capture; also the API
+    # reference's error list). Other lookups were not captured and keep
+    # StateMachineDoesNotExist.
     return error_response_json(
-        "StateMachineDoesNotExist",
-        f"State machine {arn} not found", 400)
+        "AccessDeniedException",
+        "User is not authorized to access this resource.", 400)
 
 
 def _update_state_machine(data):
@@ -3708,10 +3715,7 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
             f"Service '{service_key}' is not available in MiniStack",
         )
 
-    if service_info.get("param_case") == "lower-camel":
-        wire_data = _convert_keys_to_camel(input_data or {})
-    else:
-        wire_data = input_data
+    wire_data = _sdk_json_params(service_info, service_key, pascal_action, input_data)
     # Secrets Manager's SFN SDK integration takes literal UTF-8 text for
     # SecretBinary; its HTTP API takes base64. Translate only at this boundary,
     # without changing the state input or guessing whether the text is base64.
@@ -3752,11 +3756,73 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
             and isinstance(result, dict) and "SecretBinary" in result):
         result["SecretBinary"] = base64.b64decode(result["SecretBinary"]).decode("utf-8", errors="replace")
 
-    # For JSON-protocol services, only convert top-level keys to avoid
-    # mangling user-defined data (e.g. DynamoDB attribute names).
-    if isinstance(result, dict):
-        return {_api_name_to_sfn_key(k): v for k, v in result.items()}
-    return result
+    return _sdk_json_result(service_key, pascal_action, result)
+
+
+# The AWS SDK for Java v2 renames a member it cannot use as named, and Step
+# Functions returns that name: DynamoDB's NULL attribute value is Nul.
+_SDK_MEMBER_NAME_OVERRIDES = {("AttributeValue", "NULL"): "Nul"}
+
+
+def _sdk_json_result(service_key, action, result):
+    """A JSON-protocol aws-sdk result shaped by the operation's output model, as Step Functions returns it."""
+    model = _service_model(service_key)
+    shape = (model.operation_model(action).output_shape
+             if model is not None and action in model.operation_names else None)
+    if shape is None:
+        if isinstance(result, dict):
+            return {_api_name_to_sfn_key(k): v for k, v in result.items()}
+        return result
+    return _sdk_json_value(result, shape)
+
+
+def _sdk_json_value(value, shape):
+    if shape.type_name == "structure" and isinstance(value, dict):
+        return {
+            _SDK_MEMBER_NAME_OVERRIDES.get((shape.name, key), _api_name_to_sfn_key(key)):
+                _sdk_json_value(item, shape.members[key]) if key in shape.members else item
+            for key, item in value.items() if item is not None
+        }
+    if shape.type_name == "list" and isinstance(value, list):
+        return [_sdk_json_value(item, shape.member) for item in value]
+    if shape.type_name == "map" and isinstance(value, dict):
+        return {key: _sdk_json_value(item, shape.value) for key, item in value.items()}
+    if shape.type_name == "timestamp" and _is_num(value):
+        moment = datetime.fromtimestamp(value, timezone.utc)
+        return moment.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return value
+
+
+_SDK_PARAM_NAME_OVERRIDES = {(shape, sdk): wire for (shape, wire), sdk in _SDK_MEMBER_NAME_OVERRIDES.items()}
+
+
+def _sdk_json_params(service_info, service_key, action, input_data):
+    """aws-sdk Parameters on the wire, renamed by the operation's input model; map keys are data."""
+    model = _service_model(service_key)
+    shape = (model.operation_model(action).input_shape
+             if model is not None and action in model.operation_names else None)
+    if shape is None:
+        if service_info.get("param_case") == "lower-camel":
+            return _convert_keys_to_camel(input_data or {})
+        return input_data
+    return _sdk_json_param_value(input_data or {}, shape)
+
+
+def _sdk_json_param_value(value, shape):
+    if shape.type_name == "structure" and isinstance(value, dict) and not getattr(shape, "is_document_type", False):
+        by_sdk_name = {_api_name_to_sfn_key(name): name for name in shape.members}
+        renamed = {}
+        for key, item in value.items():
+            name = (key if key in shape.members
+                    else _SDK_PARAM_NAME_OVERRIDES.get((shape.name, key)) or by_sdk_name.get(key, key))
+            member = shape.members.get(name)
+            renamed[name] = _sdk_json_param_value(item, member) if member is not None else item
+        return renamed
+    if shape.type_name == "list" and isinstance(value, list):
+        return [_sdk_json_param_value(item, shape.member) for item in value]
+    if shape.type_name == "map" and isinstance(value, dict):
+        return {key: _sdk_json_param_value(item, shape.value) for key, item in value.items()}
+    return value
 
 
 def _flatten_query_params(data, prefix=""):
@@ -4090,17 +4156,14 @@ def _api_name_to_sfn_key(name):
     SFN uses the Java SDK V2 naming convention: consecutive uppercase characters
     (acronyms) are lowered except the last one when followed by a lowercase char.
     Examples: DBClusters -> DbClusters, DBClusterArn -> DbClusterArn,
-              IAMDatabaseAuthenticationEnabled -> IamDatabaseAuthenticationEnabled
+              IAMDatabaseAuthenticationEnabled -> IamDatabaseAuthenticationEnabled,
+              SS -> Ss
     """
     if not name:
         return name
     result = []
     i = 0
     while i < len(name):
-        if i == 0:
-            result.append(name[i].upper())
-            i += 1
-            continue
         if name[i].isupper():
             j = i
             while j < len(name) and name[j].isupper():
@@ -4119,7 +4182,8 @@ def _api_name_to_sfn_key(name):
         else:
             result.append(name[i])
             i += 1
-    return "".join(result)
+    key = "".join(result)
+    return key[0].upper() + key[1:]
 
 
 def _convert_keys_to_sfn_convention(obj):

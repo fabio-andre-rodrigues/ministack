@@ -218,6 +218,7 @@ from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.iam_evaluator import (
     AmbiguousAccessKeyError,
     find_iam_access_key_account,
+    pin_request_origin,
     pin_signed_body,
     pin_signed_request,
 )
@@ -225,6 +226,7 @@ from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import (
     _12_DIGIT_RE,
     fix_error_content_type,
+    fix_success_content_type,
     set_request_account_id,
     set_request_region,
 )
@@ -1476,6 +1478,8 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         mod_name, var_name = key.rsplit(".", 1)
         try:
             mod = __import__(f"ministack.services.{mod_name}", fromlist=[var_name])
+            # Registered so request hooks such as CloudTrail recording see the module.
+            _loaded_modules.setdefault(mod_name, mod)
             if key in (
                 "stepfunctions._SFN_WAIT_SCALE",
                 "translate._JOB_RUN_SECONDS",
@@ -2140,12 +2144,20 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
 
     # IAM enforcement for S3 virtual-hosted requests
     if AUTH:
-        from ministack.core.iam_actions import _s3_action, extract_resource_arn, s3_additional_checks
+        from ministack.core.iam_actions import (
+            _s3_action,
+            extract_resource_arn,
+            s3_additional_checks,
+            s3_service_context,
+        )
 
         s3_action = _s3_action(method, vhost_path, query_params)
         if s3_action:
             s3_resource = extract_resource_arn("s3", method, vhost_path, headers, body, query_params, "", "")
-            denied = _enforce_data_plane("s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=s3_resource)
+            denied = _enforce_data_plane(
+                "s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=s3_resource,
+                service_context=s3_service_context(f"s3:{s3_action}", query_params),
+            )
             if denied:
                 return denied
             # A copy also reads its source, a batch delete is one check per
@@ -2226,7 +2238,8 @@ def _enforce_data_plane(
             response = auth_error_response(denied) if auth_error_response else None
             return response or _credential_failure(service, iam_action, request_id, denied, headers)
         return access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers,
-                                      explicit_deny=denied.decision == "Deny")
+                                      explicit_deny=denied.decision == "Deny",
+                                      resource_policy_arn=denied.resource_policy_arn)
     return None
 
 
@@ -2548,8 +2561,9 @@ def _unknown_query_error(body: bytes, request_id: str):
         else "The requested action is not valid for this web service."
     )
     msg = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Query-protocol error envelopes carry no <?xml?> declaration on the
+    # real AWS wire (17-region capture sweep, 0/85 declarations).
     xml = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<ErrorResponse xmlns="http://webservices.amazon.com/doc/2010-05-08/">'
         f"<Error><Type>Sender</Type><Code>InvalidAction</Code><Message>{msg}</Message></Error>"
         f"<RequestId>{request_id}</RequestId></ErrorResponse>"
@@ -2598,6 +2612,8 @@ async def _dispatch_service_request(
             extract_iam_action,
             extract_resource_arn,
             logs_service_context,
+            request_tag_context,
+            s3_service_context,
         )
         from ministack.core.iam_evaluator import AuthError, enforce, pin_request_caller
         from ministack.core.responses import get_account_id
@@ -2610,7 +2626,9 @@ async def _dispatch_service_request(
                 service, method, path, headers, body, routing_params, region, get_account_id()
             )
             service_context = (
-                dynamodb_service_context(body) if service == "dynamodb" else None
+                dynamodb_service_context(body) if service == "dynamodb"
+                else s3_service_context(iam_action, query_params) if service == "s3"
+                else None
             )
             if service == "logs":
                 from ministack.services import cloudwatch_logs
@@ -2628,6 +2646,8 @@ async def _dispatch_service_request(
                 service_context = logs_service_context(
                     iam_action.split(":", 1)[1], body, resource_arn, region, get_account_id()
                 )
+            service_context = {**request_tag_context(service, iam_action, body, routing_params),
+                               **(service_context or {})}
             # A DynamoDB transaction is not itself an IAM action: each item is
             # authorized as the single-item action it performs, on its table.
             transaction_checks = (
@@ -2710,6 +2730,7 @@ async def _dispatch_service_request(
                 return access_denied_response(
                     service, iam_action, denied.principal_arn, request_id, headers=headers,
                     resource_arn=resource_arn, explicit_deny=denied.decision == "Deny",
+                    resource_policy_arn=denied.resource_policy_arn,
                 )
 
     handler = SERVICE_HANDLERS.get(service)
@@ -2730,10 +2751,12 @@ async def _dispatch_service_request(
             json.dumps({"__type": "InternalError", "message": str(e)}).encode(),
         )
 
-    # Real AWS picks an error's Content-Type from the service's protocol —
-    # normalize any generic envelope the service emitted to the wire value
-    # (evidence: diffs against committed real-AWS wire captures).
+    # Real AWS picks a response envelope's Content-Type from the service's
+    # protocol — normalize any generic envelope the service emitted to the
+    # wire value (evidence: diffs against committed real-AWS wire captures;
+    # multi-region for the success path).
     fix_error_content_type(service, status, resp_headers)
+    fix_success_content_type(service, status, resp_headers)
 
     _maybe_record_cloudtrail(service, method, path, headers, body, query_params, request_id, region)
 
@@ -2854,6 +2877,9 @@ async def app(scope, receive, send):
     # USE_SSL terminates TLS here, so no proxy sets the header; fill it in.
     if scope.get("scheme") == "https":
         headers.setdefault("x-forwarded-proto", "https")
+    if AUTH:
+        pin_request_origin((scope.get("client") or ("127.0.0.1",))[0],
+                           headers.get("x-forwarded-proto", "").split(",")[0].strip().lower() == "https")
 
     request_id = str(uuid.uuid4())
 
