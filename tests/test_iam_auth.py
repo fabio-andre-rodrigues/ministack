@@ -306,6 +306,16 @@ class TestEvaluate:
         assert evaluate(_ctx(action="s3:DeleteBucket"), [allow, deny]).decision == "Deny"
         assert evaluate(_ctx(action="s3:PutObject"), [allow, deny]).decision == "Allow"
 
+    def test_every_limit_must_allow(self):
+        identity = parse_policy_document(
+            {"Statement": [{"Effect": "Allow", "Action": ["s3:*", "sqs:*"], "Resource": "*"}]})
+        boundary = parse_policy_document(
+            {"Statement": [{"Effect": "Allow", "Action": ["s3:*", "ec2:*"], "Resource": "*"}]})
+        assert evaluate(_ctx(action="s3:PutObject"), [identity], [boundary]).decision == "Allow"
+        assert evaluate(_ctx(action="sqs:SendMessage"), [identity], [boundary]).decision == "ImplicitDeny"
+        assert evaluate(_ctx(action="ec2:RunInstances"), [identity], [boundary]).decision == "ImplicitDeny"
+        assert evaluate(_ctx(action="s3:PutObject"), [identity], []).decision == "ImplicitDeny"
+
 
 # ---------------------------------------------------------------------------
 # Condition operators (per IAM condition operators reference)
@@ -1102,6 +1112,182 @@ class TestEnforce:
             iam_svc._access_keys.pop(fake_key, None)
             iam_svc._users.pop("inline-user", None)
             iam_svc._user_inline_policies.pop("inline-user", None)
+
+
+_PROBES = {"S": "sqs:ListQueues", "D": "dynamodb:ListTables",
+           "B": "s3:ListAllMyBuckets", "L": "logs:DescribeLogGroups"}
+_IDENTITY = {"Statement": [{"Effect": "Allow", "Resource": "*",
+                            "Action": ["sqs:ListQueues", "dynamodb:ListTables", "logs:DescribeLogGroups"]}]}
+_BOUNDARY = {"Statement": [
+    {"Effect": "Allow", "Resource": "*",
+     "Action": ["sqs:ListQueues", "dynamodb:ListTables", "s3:ListAllMyBuckets"]},
+    {"Effect": "Deny", "Action": "dynamodb:ListTables", "Resource": "*"},
+]}
+
+
+def _allowed(access_key):
+    """The probe actions ``enforce`` lets through, as letters."""
+    return "".join(letter for letter, action in _PROBES.items()
+                   if enforce(access_key, action, action.split(":")[0], "us-east-1") is None)
+
+
+def _iam_call(action, **params):
+    from ministack.services import iam as iam_svc
+    status, _headers, body = iam_svc._IAM_HANDLERS[action](
+        {"Action": [action], **{k: [v] for k, v in params.items()}})
+    assert status == 200, body
+    return body
+
+
+@pytest.fixture
+def boundary_principals():
+    """A user and a role session with the probe identity policy, and a boundary policy."""
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
+    boundary = "arn:aws:iam::000000000000:policy/probe-boundary"
+    iam_svc.store_policy(boundary, "probe-boundary", "/", json.dumps(_BOUNDARY))
+    _iam_call("CreateUser", UserName="probe-user")
+    _iam_call("PutUserPolicy", UserName="probe-user", PolicyName="identity",
+              PolicyDocument=json.dumps(_IDENTITY))
+    iam_svc._access_keys["AKIATESTBOUNDARY01"] = {
+        "UserName": "probe-user", "AccessKeyId": "AKIATESTBOUNDARY01",
+        "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+    }
+    _iam_call("CreateRole", RoleName="probe-role", AssumeRolePolicyDocument=json.dumps({"Statement": [
+        {"Effect": "Allow", "Principal": {"AWS": "000000000000"}, "Action": "sts:AssumeRole"}]}))
+    _iam_call("PutRolePolicy", RoleName="probe-role", PolicyName="identity",
+              PolicyDocument=json.dumps(_IDENTITY))
+    sts_svc._sessions["ASIATESTBOUNDARY01"] = {
+        "Arn": "arn:aws:sts::000000000000:assumed-role/probe-role/s",
+        "UserId": "AROA123:s", "SecretAccessKey": "s", "PrincipalType": "AssumedRole",
+        "AccountId": "000000000000", "Expiration": time.time() + 3600,
+    }
+    try:
+        yield {"user": "AKIATESTBOUNDARY01", "role": "ASIATESTBOUNDARY01", "boundary": boundary}
+    finally:
+        sts_svc._sessions.pop("ASIATESTBOUNDARY01", None)
+        iam_svc._access_keys.pop("AKIATESTBOUNDARY01", None)
+        iam_svc._user_inline_policies.pop("probe-user", None)
+        iam_svc._users.pop("probe-user", None)
+        iam_svc._roles.pop("probe-role", None)
+        iam_svc._policies.pop(boundary, None)
+
+
+class TestPermissionsBoundary:
+    """A boundary limits identity policies: only actions both allow pass, and its Deny denies."""
+
+    @pytest.mark.parametrize("kind", ["user", "role"])
+    def test_boundary_limits_identity_policies(self, boundary_principals, kind):
+        key, boundary = boundary_principals[kind], boundary_principals["boundary"]
+        name = {"UserName": "probe-user"} if kind == "user" else {"RoleName": "probe-role"}
+        entity = "User" if kind == "user" else "Role"
+        assert _allowed(key) == "SDL"
+        _iam_call(f"Put{entity}PermissionsBoundary", PermissionsBoundary=boundary, **name)
+        assert _allowed(key) == "S"
+        _iam_call(f"Delete{entity}PermissionsBoundary", **name)
+        assert _allowed(key) == "SDL"
+
+    def test_boundary_set_at_creation(self, boundary_principals):
+        from ministack.services import iam as iam_svc
+        _iam_call("CreateUser", UserName="probe-user-2", PermissionsBoundary=boundary_principals["boundary"])
+        _iam_call("PutUserPolicy", UserName="probe-user-2", PolicyName="identity",
+                  PolicyDocument=json.dumps(_IDENTITY))
+        iam_svc._access_keys["AKIATESTBOUNDARY02"] = {
+            "UserName": "probe-user-2", "AccessKeyId": "AKIATESTBOUNDARY02",
+            "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+        }
+        try:
+            assert _allowed("AKIATESTBOUNDARY02") == "S"
+            denied = enforce("AKIATESTBOUNDARY02", "dynamodb:ListTables", "dynamodb", "us-east-1")
+            assert denied.decision == "Deny"
+        finally:
+            iam_svc._access_keys.pop("AKIATESTBOUNDARY02", None)
+            iam_svc._user_inline_policies.pop("probe-user-2", None)
+            iam_svc._users.pop("probe-user-2", None)
+
+
+def _sts_key(access_key, **params):
+    """Call STS in-process as ``access_key`` and return the issued access key."""
+    import re
+    from urllib.parse import urlencode
+
+    from ministack.services import sts as sts_svc
+    headers = {
+        "authorization": f"AWS4-HMAC-SHA256 Credential={access_key}/20260930/us-east-1/sts/aws4_request",
+        "content-type": "application/x-www-form-urlencoded",
+    }
+    body = urlencode({"Version": "2011-06-15", **params}).encode()
+    status, _headers, payload = asyncio.run(sts_svc.handle_request("POST", "/", headers, body, {}))
+    assert status == 200, payload
+    return re.search(r"<AccessKeyId>(.*?)</AccessKeyId>", payload.decode()).group(1)
+
+
+def _allow(*actions, deny=None):
+    stmts = [{"Effect": "Allow", "Action": list(actions), "Resource": "*"}]
+    if deny:
+        stmts.append({"Effect": "Deny", "Action": deny, "Resource": "*"})
+    return json.dumps({"Version": "2012-10-17", "Statement": stmts})
+
+
+@pytest.fixture
+def issued_sessions():
+    from ministack.services import sts as sts_svc
+    before = set(sts_svc._sessions)
+    yield
+    for key in set(sts_svc._sessions) - before:
+        sts_svc._sessions.pop(key, None)
+
+
+class TestSessionPolicies:
+    """Session policies narrow a session to what both allow; a federated user without one gets nothing."""
+
+    def _assume(self, **params):
+        return _sts_key("test", Action="AssumeRole", RoleSessionName="s",
+                        RoleArn="arn:aws:iam::000000000000:role/probe-role", **params)
+
+    def test_session_policy_limits_the_role(self, boundary_principals, issued_sessions):
+        from ministack.services import iam as iam_svc
+        logs = "arn:aws:iam::000000000000:policy/probe-logs"
+        iam_svc.store_policy(logs, "probe-logs", "/", _allow("logs:DescribeLogGroups"))
+        try:
+            assert _allowed(self._assume()) == "SDL"
+            assert _allowed(self._assume(Policy=_allow("sqs:ListQueues", "s3:ListAllMyBuckets"))) == "S"
+            assert _allowed(self._assume(**{"PolicyArns.member.1.arn": logs})) == "L"
+            assert _allowed(self._assume(Policy=_allow("*", deny="dynamodb:ListTables"))) == "SL"
+        finally:
+            iam_svc._policies.pop(logs, None)
+
+    def test_session_policy_and_boundary_both_limit(self, boundary_principals, issued_sessions):
+        _iam_call("PutRolePermissionsBoundary", RoleName="probe-role",
+                  PermissionsBoundary=boundary_principals["boundary"])
+        assert _allowed(self._assume(Policy=_allow("dynamodb:ListTables", "logs:DescribeLogGroups"))) == ""
+        assert _allowed(self._assume(Policy=_allow("*"))) == "S"
+
+    def test_federated_user_is_limited_by_user_and_session_policies(self, boundary_principals, issued_sessions):
+        user = boundary_principals["user"]
+        fed = _sts_key(user, Action="GetFederationToken", Name="fed",
+                       Policy=_allow("sqs:ListQueues", "s3:ListAllMyBuckets"))
+        assert _allowed(fed) == "S"
+        assert _allowed(_sts_key(user, Action="GetFederationToken", Name="fed")) == ""
+        _iam_call("PutUserPermissionsBoundary", UserName="probe-user",
+                  PermissionsBoundary=boundary_principals["boundary"])
+        assert _allowed(_sts_key(user, Action="GetFederationToken", Name="fed", Policy=_allow("*"))) == "S"
+
+    def test_federated_user_principal_tags_are_the_session_tags(self, boundary_principals, issued_sessions):
+        from ministack.services import iam as iam_svc
+        iam_svc._users["probe-user"]["Tags"] = [{"Key": "team", "Value": "blue"}, {"Key": "env", "Value": "dev"}]
+        fed = _sts_key(boundary_principals["user"], Action="GetFederationToken", Name="fed", Policy=_allow("*"),
+                       **{"Tags.member.1.Key": "TEAM", "Tags.member.1.Value": "green"})
+        keys = resolve_principal(fed, "000000000000").keys
+        assert keys["aws:principaltag/team"] == "green" and "aws:principaltag/env" not in keys
+        assert keys["aws:userid"] == "000000000000:fed" and "aws:username" not in keys
+
+    def test_root_federation_is_limited_by_the_session_policy(self, issued_sessions):
+        fed = _sts_key("test", Action="GetFederationToken", Name="fed", Policy=_allow("sqs:ListQueues"))
+        assert _allowed(fed) == "S"
+        assert resolve_principal(fed, "000000000000").arn == "arn:aws:sts::000000000000:federated-user/fed"
+
+
 class TestCustomerManagedPolicyResolution:
     """Customer policies belong to the explicit account and use full ARNs."""
 
@@ -1168,6 +1354,59 @@ class TestCustomerManagedPolicyResolution:
             assert (get_account_id(), get_region()) == (self.OTHER, "eu-west-1")
 
 
+class TestCombineResourcePolicy:
+    """An identity decision combined with the policy of the resource the request addresses."""
+
+    _USER = "arn:aws:iam::000000000000:user/u"
+
+    def _decide(self, identity, principal, effect="Allow", owner="000000000000", caller=_USER, limits=()):
+        from ministack.core.iam_evaluator import combine_resource_policy
+
+        ctx = EvalContext(principal_arn=caller, principal_type="User", principal_account="000000000000",
+                          action="sqs:SendMessage", resource_arn=f"arn:aws:sqs:us-east-1:{owner}:q",
+                          region="us-east-1")
+        policy = {"Statement": [{"Effect": effect, "Principal": {"AWS": principal},
+                                 "Action": "sqs:*", "Resource": "*"}]}
+        return combine_resource_policy(EvalResult(identity, caller), ctx, policy, owner, limits=limits).decision
+
+    @pytest.mark.parametrize("identity,principal,effect,owner,expected", [
+        ("ImplicitDeny", _USER, "Allow", "000000000000", "Allow"),
+        ("ImplicitDeny", "*", "Allow", "000000000000", "Allow"),
+        ("ImplicitDeny", "arn:aws:iam::000000000000:root", "Allow", "000000000000", "ImplicitDeny"),
+        ("ImplicitDeny", "000000000000", "Allow", "000000000000", "ImplicitDeny"),
+        ("Allow", "arn:aws:iam::000000000000:root", "Allow", "000000000000", "Allow"),
+        ("Allow", _USER, "Deny", "000000000000", "Deny"),
+        ("Allow", "arn:aws:iam::000000000000:user/other", "Deny", "000000000000", "Allow"),
+        ("ImplicitDeny", _USER, "Allow", "111111111111", "ImplicitDeny"),
+        ("Allow", "000000000000", "Allow", "111111111111", "Allow"),
+        ("Allow", "arn:aws:iam::111111111111:root", "Allow", "111111111111", "ImplicitDeny"),
+    ])
+    def test_decision(self, identity, principal, effect, owner, expected):
+        assert self._decide(identity, principal, effect, owner) == expected
+
+    def test_a_statement_naming_the_role_names_its_sessions(self):
+        session = "arn:aws:sts::000000000000:assumed-role/r/s"
+        assert self._decide("ImplicitDeny", "arn:aws:iam::000000000000:role/app/r", caller=session) == "Allow"
+        assert self._decide("ImplicitDeny", "arn:aws:iam::000000000000:role/x", caller=session) == "ImplicitDeny"
+
+    _SESSION = "arn:aws:sts::000000000000:assumed-role/r/s"
+
+    @pytest.mark.parametrize("caller,principal,limit_action,expected", [
+        (_USER, _USER, "sqs:ListQueues", "Allow"),
+        (_USER, "*", "sqs:ListQueues", "ImplicitDeny"),
+        (_SESSION, _SESSION, "sqs:ListQueues", "Allow"),
+        (_SESSION, "arn:aws:iam::000000000000:role/r", "sqs:ListQueues", "ImplicitDeny"),
+        (_SESSION, "arn:aws:iam::000000000000:role/r", "sqs:SendMessage", "Allow"),
+        ("arn:aws:sts::000000000000:federated-user/f", "arn:aws:sts::000000000000:federated-user/f",
+         "sqs:ListQueues", "ImplicitDeny"),
+    ])
+    def test_limits_narrow_a_resource_allow_unless_it_names_the_user_or_session(
+            self, caller, principal, limit_action, expected):
+        from ministack.core.iam_evaluator import parse_policy_document
+
+        limit = [parse_policy_document({"Statement": [
+            {"Effect": "Allow", "Action": limit_action, "Resource": "*"}]})]
+        assert self._decide("ImplicitDeny", principal, caller=caller, limits=(limit,)) == expected
 @contextlib.contextmanager
 def _iam_user(name, tags=()):
     """A stored IAM user with one access key; yields the key and a setter for its inline policy."""
@@ -1768,6 +2007,12 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("lambda", "POST", "/2015-03-31/functions/my-func/invocations", {}, b"", {}, "us-east-1", "123") == "arn:aws:lambda:us-east-1:123:function:my-func"
 
+    def test_lambda_function_named_by_arn(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        path = "/2015-03-31/functions/arn%3Aaws%3Alambda%3Aus-east-1%3A123%3Afunction%3Amy-func/invocations"
+        assert extract_resource_arn(
+            "lambda", "POST", path, {}, b"", {}, "us-east-1", "123"
+        ) == "arn:aws:lambda:us-east-1:123:function:my-func"
     @pytest.mark.parametrize("arn", [
         "arn:aws:lambda:us-east-1:123:function:f", "arn%3Aaws%3Alambda%3Aus-east-1%3A123%3Afunction%3Af"])
     @pytest.mark.parametrize("method", ["GET", "POST", "DELETE"])
@@ -1778,7 +2023,13 @@ class TestResourceArn:
 
     def test_sqs_queue_url(self):
         from ministack.core.iam_actions import extract_resource_arn
-        assert extract_resource_arn("sqs", "POST", "/", {}, b"", {"QueueUrl": ["http://localhost:4566/000000000000/my-queue"]}, "us-east-1", "123") == "arn:aws:sqs:us-east-1:123:my-queue"
+        url = "http://localhost:4566/000000000000/my-queue"
+        assert extract_resource_arn(
+            "sqs", "POST", "/", {}, b"", {"QueueUrl": [url]}, "us-east-1", "123"
+        ) == "arn:aws:sqs:us-east-1:000000000000:my-queue"
+        assert extract_resource_arn(
+            "sqs", "POST", "/", {}, b"", {"QueueUrl": ["my-queue"]}, "us-east-1", "123"
+        ) == "arn:aws:sqs:us-east-1:123:my-queue"
 
     def test_sqs_create_queue(self):
         from ministack.core.iam_actions import extract_resource_arn
@@ -2102,6 +2353,14 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("iot", "GET", "/provisioning-templates/fleet", {}, b"", {}, "us-east-1", "123") == "arn:aws:iot:us-east-1:123:provisioningtemplate/fleet"
 
+    def test_iot_provisioning_claim(self):
+        from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+        path = "/provisioning-templates/fleet/provisioning-claim"
+        assert extract_iam_action("iot", "POST", path, {}, b"", {}) == "iot:CreateProvisioningClaim"
+        assert extract_resource_arn(
+            "iot", "POST", path, {}, b"", {}, "us-east-1", "123"
+        ) == "arn:aws:iot:us-east-1:123:provisioningtemplate/fleet"
+
     def test_iot_job_template(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn(
@@ -2177,22 +2436,23 @@ class TestResourceArn:
             service, "POST", path, headers, b"", {}, "eu-central-1", "123"
         ) == "arn:aws:iot:eu-central-1:123:topic/sensors/rack-1/temperature"
 
-    def test_publish_resolves_the_same_topic_however_the_sdk_sent_it(self):
-        """Publish's URI label is non-greedy, so botocore percent-encodes the
-        separators and the ASGI server hands them back decoded. Both spellings
-        have to name one resource, or the grant matches on one path only."""
+    def test_publish_topic_arn_keeps_a_literal_percent_sequence(self):
+        """A %41 or %2F left in the decoded Publish path is part of the topic name and stays in the ARN."""
         from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
         from ministack.core.router import detect_service
 
         headers = _sigv4_headers("iotdata", "data-ats.iot.eu-central-1.amazonaws.com")
-        expected = "arn:aws:iot:eu-central-1:123:topic/sensors/rack-1/temperature"
-        for path in ("/topics/sensors/rack-1/temperature",
-                     "/topics/sensors%2Frack-1%2Ftemperature"):
-            service = detect_service("POST", path, headers, {})
-            assert extract_iam_action(service, "POST", path, headers, b"", {}) == "iot:Publish"
+        for method, path, action, topic in (
+            ("POST", "/topics/sensors/p%41q", "iot:Publish", "sensors/p%41q"),
+            ("POST", "/topics/sensors/p%2Fq", "iot:Publish", "sensors/p%2Fq"),
+            ("GET", "/retainedMessage/sensors/p%25q", "iot:GetRetainedMessage", "sensors/p%25q"),
+        ):
+            service = detect_service(method, path, headers, {})
+            assert service == "iot-data"
+            assert extract_iam_action(service, method, path, headers, b"", {}) == action
             assert extract_resource_arn(
-                service, "POST", path, headers, b"", {}, "eu-central-1", "123"
-            ) == expected
+                service, method, path, headers, b"", {}, "eu-central-1", "123"
+            ) == f"arn:aws:iot:eu-central-1:123:topic/{topic}"
 
     def test_create_job_resolves_through_the_router(self):
         from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
@@ -3659,6 +3919,11 @@ class TestExtractResourceArn:
         # Query-protocol callers address the queue by path.
         assert self._arn("sqs", path="/000000000000/my-queue") == (
             "arn:aws:sqs:us-east-1:000000000000:my-queue")
+
+    def test_sqs_queue_in_another_account_keeps_its_owner(self):
+        body = json.dumps({"QueueUrl": "http://localhost:4566/111111111111/my-queue"}).encode()
+        assert self._arn("sqs", body=body) == "arn:aws:sqs:us-east-1:111111111111:my-queue"
+        assert self._arn("sqs", path="/111111111111/my-queue") == "arn:aws:sqs:us-east-1:111111111111:my-queue"
 
     def test_sqs_without_a_queue_falls_back_to_star(self):
         assert self._arn("sqs", body=json.dumps({"MaxResults": 10}).encode()) == "*"
